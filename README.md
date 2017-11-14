@@ -15,6 +15,6 @@ will take this file,
 
 and produce this file,
 
-![Grey](https://raw.githubusercontent.com/daleobrien/fractal_pie/raw/master/output_lena.png)
+![Grey](https://raw.githubusercontent.com/daleobrien/fractal_pie/master/output_lena.png)
 
 That is all.
