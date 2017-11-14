@@ -11,10 +11,10 @@ Running,
 
 will take this file,
 
-![Lena](/daleobrien/fractal_pie/raw/master/lena.png)
+![Lena](https://raw.githubusercontent.com/daleobrien/fractal_pie/master/lena.png)
 
 and produce this file,
 
-![Grey](/daleobrien/fractal_pie/raw/master/output_lena.png)
+![Grey](https://raw.githubusercontent.com/daleobrien/fractal_pie/raw/master/output_lena.png)
 
 That is all.
