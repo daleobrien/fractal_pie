@@ -1,7 +1,7 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import png
-from itertools import izip_longest
+from itertools import zip_longest
 import numpy as np
 
 
@@ -40,7 +40,7 @@ def find_plane(data,
     A = ((sxx, syx, sx), (syx, sxx, sx), (sx, sx, sn))
     B = (sxz, syz, sz)
 
-    a, b, c = [int(_x + 0.499999) for _x in np.linalg.lstsq(A, B)[0]]
+    a, b, c = [int(_x + 0.499999) for _x in np.linalg.lstsq(A, B, rcond=None)[0]]
 
     error = 0
     for i, row in enumerate(data[x_offset:x_offset + n]):
@@ -69,7 +69,7 @@ def split_range_into_quad(x, y, n):
 def grouper(n, iterable, fillvalue=None):
     "grouper(3, 'ABCDEFG', 'x') --> ABC DEF Gxx"
     args = [iter(iterable)] * n
-    return izip_longest(fillvalue=fillvalue, *args)
+    return zip_longest(fillvalue=fillvalue, *args)
 
 
 def check_quadrant(input_image, output, x, y, n, tree, parameters, max_error):
@@ -89,11 +89,11 @@ def check_quadrant(input_image, output, x, y, n, tree, parameters, max_error):
 
 
 def compress(input_image_name, output_image_name):
-    print 'processing ', input_image_name
+    print('processing ', input_image_name)
 
     # Load image
     grey = []
-    f = open(input_image_name, 'r')
+    f = open(input_image_name, 'rb')
     r = png.Reader(f)
     (x, y, data, details) = r.read()
     planes = details['planes']
@@ -103,9 +103,9 @@ def compress(input_image_name, output_image_name):
         # make new image, but make it grey
         # might be a better way of making it grey too
         if planes == 3:
-            grey.append([(r + g + b) / 3 for r, g, b in grouper(3, row)])
+            grey.append([(r + g + b) // 3 for r, g, b in grouper(3, row)])
         elif planes == 4:
-            grey.append([(r + g + b) / 3 for r, g, b, _ in grouper(4, row)])
+            grey.append([(r + g + b) // 3 for r, g, b, _ in grouper(4, row)])
 
     f.close()
 
@@ -117,10 +117,10 @@ def compress(input_image_name, output_image_name):
 
     check_quadrant(grey, output, x, y, n, tree, parameters, 32)
 
-    approximate_compressed_size = len(tree) / 8 + len(parameters) + 2
+    approximate_compressed_size = len(tree) // 8 + len(parameters) + 2
 
-    print 'maybe need around %d bytes to store compressed image (greyscale)' %\
-        approximate_compressed_size
+    print('maybe need around %d bytes to store compressed image (greyscale)' %\
+        approximate_compressed_size)
 
     # write it out
     f = open(output_image_name, 'wb')

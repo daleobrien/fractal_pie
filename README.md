@@ -14,7 +14,10 @@ will take this file,
 ![Lena](https://raw.githubusercontent.com/daleobrien/fractal_pie/master/lena.png)
 
 and produce this file,
-
+```
+  processing  lena.png
+  maybe need around 128035 bytes to store compressed image (greyscale)
+```
 ![Grey](https://raw.githubusercontent.com/daleobrien/fractal_pie/master/output_lena.png)
 
 That is all.
