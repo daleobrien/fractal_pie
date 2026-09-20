@@ -562,8 +562,10 @@ pub fn encode_file(input: &str, output: &str, options: Options) -> Result<(), Bo
         "greyscale"
     };
     let pct = 100.0 * size as f64 / raw as f64;
-    let ratio = raw as f64 / size as f64;
-    println!("wrote       {output} ({size:>8} bytes, {kind} ({pct:.1}%, {ratio:.2}:1))");
+    // `raw` is three bytes per pixel for colour and one for greyscale.
+    let pixels = raw / if encoded.colour { 3 } else { 1 };
+    let bpp = 8.0 * size as f64 / pixels as f64;
+    println!("wrote       {output} ({size:>8} bytes, {kind} ({pct:.1}%, {bpp:.2} bpp))");
     Ok(())
 }
 

@@ -22,7 +22,7 @@ There are two binaries. `pie-encode` compresses a PNG into a `.pie` file:
     cargo run --release --bin pie-encode -- lena.png lena.pie
 
     processing  lena.png (  786432 bytes)
-    wrote       lena.pie (   57369 bytes, colour (7.3%, 13.71:1))
+    wrote       lena.pie (   57369 bytes, colour (7.3%, 1.75 bpp))
 
 `pie-decode` turns it back into a PNG:
 
@@ -45,15 +45,15 @@ flags on the encoder:
 chroma bound. A larger bound tolerates a coarser fit, so fewer regions are
 subdivided and the file gets smaller. For the 512x512 Lena image:
 
-| luma | chroma | `.pie` | ratio  |
-| ---- | ------ | ------ | ------ |
-| 32   | 16     | 67326  | 11.68:1 |
-| 32   | 32     | 61062  | 12.88:1 |
-| 32   | 64     | 57369  | 13.71:1 |
-| 32   | 128    | 55824  | 14.09:1 |
-| 32   | 256    | 55463  | 14.18:1 |
-| 64   | 64     | 38501  | 20.43:1 |
-| 16   | 64     | 85925  | 9.15:1 |
+| luma | chroma | `.pie` | bpp  |
+| ---- | ------ | ------ | ---- |
+| 32   | 16     | 67326  | 2.05 |
+| 32   | 32     | 61062  | 1.86 |
+| 32   | 64     | 57369  | 1.75 |
+| 32   | 128    | 55824  | 1.70 |
+| 32   | 256    | 55463  | 1.69 |
+| 64   | 64     | 38501  | 1.17 |
+| 16   | 64     | 85925  | 2.62 |
 
 The luma plane dominates: once the chroma bound reaches about 128 the chroma
 planes cost next to nothing.
@@ -66,12 +66,12 @@ choices follow from the region's dimensions alone, so the decoder reproduces
 them for free and no image has to be padded to a square. The extra two-way
 nodes cost very little, even at extreme ratios:
 
-| image   | `.pie` | ratio   |
-| ------- | ------ | ------- |
-| 512x512 | 57369  | 13.71:1 |
-| 512x200 | 27457  | 11.19:1 |
-| 200x512 | 27198  | 11.29:1 |
-| 1024x64 | 13983  | 14.06:1 |
+| image   | `.pie` | bpp  |
+| ------- | ------ | ---- |
+| 512x512 | 57369  | 1.75 |
+| 512x200 | 27457  | 2.15 |
+| 200x512 | 27198  | 2.12 |
+| 1024x64 | 13983  | 1.71 |
 
 The non-square figures are crops/rescales of Lena, all at the default bounds.
 
@@ -79,7 +79,7 @@ Any image dimensions are supported. Already-greyscale inputs skip the YCbCr
 step and are encoded directly:
 
     processing  grey.png (  262144 bytes)
-    wrote       grey.pie (   55487 bytes, greyscale (21.2%, 4.72:1))
+    wrote       grey.pie (   55487 bytes, greyscale (21.2%, 1.69 bpp))
 
 ## Colour
 
@@ -93,8 +93,8 @@ eye is far less sensitive to colour detail than to brightness.
 ## Where the compression comes from
 
 A naive encoding of the quadtree would spend one bit per tree entry and three
-bytes per leaf, which puts it at roughly 6:1.
-The `.pie` file does much better (13.68:1 instead of 6:1) by coding every
+bytes per leaf, which puts it at roughly 4 bpp for colour.
+The `.pie` file does much better (1.75 bpp instead of 4 bpp) by coding every
 decision against a probability that adapts as the image is processed:
 
 * **Range coding.** Every bit goes through a binary range coder whose models
