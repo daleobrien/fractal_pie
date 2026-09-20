@@ -24,7 +24,14 @@
 //! a 1x1 node can never split, so its split bit is implied and not coded. A
 //! leaf then codes its plane `pixel = a*i + b*j + c` as three integers.
 //!
-//! Two tricks keep those integers small:
+//! The split bit is coded against a context built from three things:
+//!
+//! * the node's depth,
+//! * whether the previous sibling also split, and
+//! * how finely the region directly above the node was split — detail is
+//!   spatially clustered, so a finely split neighbour is a strong hint.
+//!
+//! Two tricks keep the plane integers small:
 //!
 //! * The constant `c` is *predicted* from the pixels already reconstructed
 //!   around the leaf's top-left corner, and only the signed residual is coded.
@@ -34,7 +41,8 @@
 //!   Elias-gamma binarisation: a unary bit-length prefix, then the mantissa.
 //!
 //! The decoder paints each leaf it decodes into the same reconstruction buffer
-//! the encoder used, so the predictor sees identical pixels on both sides.
+//! the encoder used, so the predictor and the spatial context see identical
+//! pixels on both sides.
 
 use std::error::Error;
 
@@ -54,6 +62,10 @@ const HEADER_LEN: usize = 4 + 1 + 4 + 4 + 8 + 8;
 const MAX_BITS: usize = 64;
 /// Number of tree depths that get their own split-probability model.
 const MAX_DEPTH: usize = 24;
+/// Spatial split contexts, from the leaf size above the node: 0 = unknown (the
+/// top row of the image), 1 = finer than this node, 2 = the same size, 3 =
+/// coarser.
+const SPATIAL_CTX: usize = 4;
 
 /// A compressed image, plus the numbers needed to report on it.
 pub struct Encoded {
@@ -151,8 +163,8 @@ impl IntModels {
 
 /// Models for one plane's quadtree.
 struct PlaneModels {
-    /// Split decision, indexed by `depth * 2 + previous_sibling_split`.
-    split: [BitModel; MAX_DEPTH * 2],
+    /// Split decisions, indexed by [`PlaneModels::split_index`].
+    split: [BitModel; MAX_DEPTH * 2 * SPATIAL_CTX],
     a: IntModels,
     b: IntModels,
     c: IntModels,
@@ -161,16 +173,34 @@ struct PlaneModels {
 impl PlaneModels {
     fn new() -> Self {
         PlaneModels {
-            split: [BitModel::new(); MAX_DEPTH * 2],
+            split: [BitModel::new(); MAX_DEPTH * 2 * SPATIAL_CTX],
             a: IntModels::new(),
             b: IntModels::new(),
             c: IntModels::new(),
         }
     }
 
+    /// Combine the split contexts into one model index.
     #[inline]
-    fn split_index(&self, depth: usize, prev_split: bool) -> usize {
-        depth.min(MAX_DEPTH - 1) * 2 + prev_split as usize
+    fn split_index(&self, depth: usize, prev_split: bool, spatial: usize) -> usize {
+        (depth.min(MAX_DEPTH - 1) * 2 + prev_split as usize) * SPATIAL_CTX + spatial
+    }
+}
+
+/// Compare a neighbour's leaf size to this node's size.
+///
+/// A leaf of exactly size `n` covering `(x, y)` must start at `(x, y)` (both
+/// are aligned to `n`), so this cleanly tells the three interesting cases
+/// apart: the neighbour was split finer than this node, is a leaf of the same
+/// size, or is part of a coarser leaf that never reached this depth.
+#[inline]
+fn classify(neighbour: usize, n: usize) -> usize {
+    if neighbour < n {
+        1
+    } else if neighbour == n {
+        2
+    } else {
+        3
     }
 }
 
@@ -179,6 +209,8 @@ struct Recon {
     w: usize,
     buf: Vec<u8>,
     mask: Vec<bool>,
+    /// Size of the leaf that owns each painted pixel, used as split context.
+    leaf_size: Vec<u32>,
 }
 
 impl Recon {
@@ -187,7 +219,23 @@ impl Recon {
             w,
             buf: vec![0u8; w * h],
             mask: vec![false; w * h],
+            leaf_size: vec![0u32; w * h],
         }
+    }
+
+    /// Context describing how finely the pixel directly above the node's
+    /// top-left corner was split. The rows above are visited first, so the
+    /// answer is already known; it is `0` when nothing has been painted there
+    /// yet (the top row of the image).
+    fn spatial_ctx(&self, x: usize, y: usize, n: usize) -> usize {
+        if x == 0 {
+            return 0;
+        }
+        let idx = (x - 1) * self.w + y;
+        if !self.mask[idx] {
+            return 0;
+        }
+        classify(self.leaf_size[idx] as usize, n)
     }
 
     /// Predict a leaf's constant term from the reconstructed pixels above-left,
@@ -232,7 +280,7 @@ impl Recon {
     }
 
     /// Paint a leaf's plane over its sub-image, exactly as [`crate::render`]
-    /// would.
+    /// would, recording the leaf size for later spatial contexts.
     fn paint(&mut self, plane: &Plane, x: usize, y: usize, n: usize) {
         for i in 0..n {
             let base = (x + i) * self.w + y;
@@ -240,6 +288,7 @@ impl Recon {
             for j in 0..n {
                 self.buf[base + j] = (ai + plane.b * j as i64).clamp(0, 255) as u8;
                 self.mask[base + j] = true;
+                self.leaf_size[base + j] = n as u32;
             }
         }
     }
@@ -275,7 +324,7 @@ fn encode_node(
     let is_leaf = leaf.x == x && leaf.y == y && leaf.n == n;
 
     if n > 1 {
-        let ctx = models.split_index(depth, prev_split);
+        let ctx = models.split_index(depth, prev_split, recon.spatial_ctx(x, y, n));
         enc.encode_bit(&mut models.split[ctx], if is_leaf { 0 } else { 1 });
     }
 
@@ -299,7 +348,7 @@ fn encode_node(
     }
 }
 
-/// Decode one plane's tree, returning the reconstructed plane.
+/// Decode one plane's tree, returning whether this node was a leaf.
 #[allow(clippy::too_many_arguments)]
 fn decode_node(
     dec: &mut Decoder,
@@ -314,7 +363,7 @@ fn decode_node(
     let is_leaf = if n <= 1 {
         true
     } else {
-        let ctx = models.split_index(depth, prev_split);
+        let ctx = models.split_index(depth, prev_split, recon.spatial_ctx(x, y, n));
         dec.decode_bit(&mut models.split[ctx]) == 0
     };
 
@@ -506,11 +555,6 @@ pub fn encode_file(input: &str, output: &str, options: Options) -> Result<(), Bo
         "greyscale"
     };
     println!("wrote       {output} ({size} bytes, {kind})");
-    let pct = 100.0 * size as f64 / encoded.estimate.max(1) as f64;
-    println!(
-        "quadtree estimate {} bytes -> {} bytes ({pct:.1}% of estimate)",
-        encoded.estimate, size
-    );
     println!(
         "compression ratio: {:.2}:1 ({} bytes raw -> {size} bytes)",
         encoded.raw as f64 / size as f64,
@@ -536,11 +580,12 @@ pub fn decode_file(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let kind = if info.colour { "colour" } else { "greyscale" };
-    println!(
-        "wrote       {output} ({}x{} {kind})",
-        info.width, info.height
-    );
+    let kind = if info.colour {
+        "colour"
+    } else {
+        "greyscale"
+    };
+    println!("wrote       {output} ({}x{} {kind})", info.width, info.height);
     Ok(())
 }
 
@@ -568,6 +613,13 @@ mod tests {
         for v in [-1000i64, -2, -1, 0, 1, 2, 1000, i64::MAX, i64::MIN] {
             assert_eq!(unzigzag(zigzag(v)), v);
         }
+    }
+
+    #[test]
+    fn classify_orders_leaf_sizes() {
+        assert_eq!(classify(4, 8), 1);
+        assert_eq!(classify(8, 8), 2);
+        assert_eq!(classify(16, 8), 3);
     }
 
     #[test]

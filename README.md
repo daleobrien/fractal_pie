@@ -19,9 +19,8 @@ There are two binaries. `pie-encode` compresses a PNG into a `.pie` file:
     cargo run --release --bin pie-encode -- lena.png lena.pie
 
     processing  lena.png
-    wrote       lena.pie (57498 bytes, colour)
-    quadtree estimate 131172 bytes -> 57498 bytes (43.8% of estimate)
-    compression ratio: 13.68:1 (786432 bytes raw -> 57498 bytes)
+    wrote       lena.pie (57369 bytes, colour)
+    compression ratio: 13.71:1 (786432 bytes raw -> 57369 bytes)
 
 `pie-decode` turns it back into a PNG:
 
@@ -46,13 +45,13 @@ subdivided and the file gets smaller. For the 512x512 Lena image:
 
 | luma | chroma | `.pie` | ratio  |
 | ---- | ------ | ------ | ------ |
-| 32   | 16     | 67480  | 11.65:1 |
-| 32   | 32     | 61196  | 12.85:1 |
-| 32   | 64     | 57498  | 13.68:1 |
-| 32   | 128    | 55958  | 14.05:1 |
-| 32   | 256    | 55598  | 14.14:1 |
-| 64   | 64     | 38588  | 20.38:1 |
-| 16   | 64     | 86052  | 9.14:1 |
+| 32   | 16     | 67326  | 11.68:1 |
+| 32   | 32     | 61062  | 12.88:1 |
+| 32   | 64     | 57369  | 13.71:1 |
+| 32   | 128    | 55824  | 14.09:1 |
+| 32   | 256    | 55463  | 14.18:1 |
+| 64   | 64     | 38501  | 20.43:1 |
+| 16   | 64     | 85925  | 9.15:1 |
 
 The luma plane dominates: once the chroma bound reaches about 128 the chroma
 planes cost next to nothing.
@@ -61,8 +60,8 @@ The input must be a square PNG. Already-greyscale inputs skip the YCbCr step
 and are encoded directly:
 
     processing  grey.png
-    wrote       grey.pie (55621 bytes, greyscale)
-    compression ratio: 4.71:1 (262144 bytes raw -> 55621 bytes)
+    wrote       grey.pie (55487 bytes, greyscale)
+    compression ratio: 4.72:1 (262144 bytes raw -> 55487 bytes)
 
 ## Colour
 
@@ -76,7 +75,7 @@ eye is far less sensitive to colour detail than to brightness.
 ## Where the compression comes from
 
 A naive encoding of the quadtree would spend one bit per tree entry and three
-bytes per leaf, which is what the program's `quadtree estimate` line reports.
+bytes per leaf, which puts it at roughly 6:1.
 The `.pie` file does much better (13.68:1 instead of 6:1) by coding every
 decision against a probability that adapts as the image is processed:
 
@@ -84,8 +83,10 @@ decision against a probability that adapts as the image is processed:
   start at 1/2 and drift towards whatever actually happens, so a decision that
   is almost always the same costs far less than one bit.
 * **Tree structure.** Each internal node codes one split bit, conditioned on
-  the node's depth and on whether its previous sibling split. A 1x1 node can
-  never split, so its split bit is implied and never coded.
+  the node's depth, on whether its previous sibling split, and on how finely
+  the region directly above it was split (detail is spatially clustered, so a
+  finely split neighbour is a strong hint). A 1x1 node can never split, so its
+  split bit is implied and never coded.
 * **Predictive constants.** A leaf's `c` is the plane's value at its top-left
   pixel, so it is predicted from the already-decoded pixels above and beside
   that corner and only the residual is coded. This is what makes smooth regions
@@ -96,6 +97,18 @@ decision against a probability that adapts as the image is processed:
 
 Averaged over the planes, the result is about 1.4 bytes per leaf, against the
 3 bytes per leaf in the naive estimate.
+
+Things that were tried and did **not** earn their keep, measured on Lena:
+
+* Predicting Cr's split decisions from Cb's. The two chroma planes are
+  decorrelated by the YCbCr transform, and the "is this region detailed?"
+  signal is already carried by the same-plane spatial context above. As a
+  split context it was a wash (57496 with it, versus a 57498 baseline), and a
+  lean 2-state version was worse still (57521). As a value predictor for Cr's
+  constant term it made the file 27 bytes *bigger* instead of smaller.
+* JPEG-LS's median edge detector for the `c` predictor. Because `c` is a
+  least-squares intercept (already smoothed over the leaf), a plain mean of
+  the neighbouring pixels beats an edge-preserving predictor.
 
 ## The `.pie` format
 
