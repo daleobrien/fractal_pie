@@ -1,0 +1,17 @@
+[package]
+name = "fractal-pie"
+version = "0.1.0"
+edition = "2021"
+description = "Fractal image compression by quadtree plane fitting"
+readme = "README.md"
+
+[dependencies]
+png = "0.17"
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
