@@ -19,8 +19,7 @@
 //! rendered image and the reported compressed-size estimate match.
 
 use std::error::Error;
-use std::fs::File;
-use std::io::BufReader;
+use std::path::Path;
 
 use rayon::prelude::*;
 
@@ -137,8 +136,8 @@ pub struct Colour {
     pub cr: Vec<u8>,
 }
 
-/// A decoded PNG, tagged with whether it should be compressed as greyscale or
-/// as colour.
+/// A decoded image, tagged with whether it should be compressed as greyscale
+/// or as colour.
 pub enum Image {
     Grey(Grey),
     Colour(Colour),
@@ -514,65 +513,40 @@ pub(crate) fn combine_to_rgb(
     rgb
 }
 
-/// A decoded PNG: its colour type, dimensions, and 8-bit samples.
-type DecodedPng = (png::ColorType, usize, usize, Vec<u8>);
-
-/// Decode a PNG to plain 8-bit samples, normalising palettes and bit depths.
-fn decode_png(path: &str) -> Result<DecodedPng, Box<dyn Error>> {
-    let file = BufReader::new(File::open(path)?);
-    let mut decoder = png::Decoder::new(file);
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-
-    let mut reader = decoder.read_info()?;
-    let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf)?;
-    buf.truncate(info.buffer_size());
-    Ok((
-        info.color_type,
-        info.width as usize,
-        info.height as usize,
-        buf,
-    ))
-}
-
-/// Read a PNG, converting it to 8-bit greyscale or 4:2:0 YCbCr depending on
-/// whether it carries colour.
+/// Read an image in any supported format, converting it to 8-bit greyscale or
+/// 4:2:0 YCbCr depending on whether it carries colour.
+///
+/// The format is chosen from the file extension; see
+/// [`SUPPORTED_EXTENSIONS`] for the list, and [`read_greyscale`] to force a
+/// greyscale result.
 pub fn read_image(path: &str) -> Result<Image, Box<dyn Error>> {
-    let (color_type, width, height, data) = decode_png(path)?;
-    match color_type {
-        png::ColorType::Grayscale => Ok(Image::Grey(Grey {
+    let image = decode_image(path)?;
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    if image.color().has_color() {
+        let rgb = image.to_rgb8();
+        Ok(Image::Colour(Colour::from_rgb(rgb.as_raw(), width, height)))
+    } else {
+        Ok(Image::Grey(Grey {
             width,
             height,
-            data,
-        })),
-        png::ColorType::GrayscaleAlpha => Ok(Image::Grey(Grey {
-            width,
-            height,
-            data: data.chunks_exact(2).map(|p| p[0]).collect(),
-        })),
-        png::ColorType::Rgb => Ok(Image::Colour(Colour::from_rgb(&data, width, height))),
-        png::ColorType::Rgba => {
-            let rgb: Vec<u8> = data
-                .chunks_exact(4)
-                .flat_map(|p| [p[0], p[1], p[2]])
-                .collect();
-            Ok(Image::Colour(Colour::from_rgb(&rgb, width, height)))
-        }
-        other => Err(format!("unsupported PNG colour type: {other:?}").into()),
+            data: image.to_luma8().into_raw(),
+        }))
     }
 }
 
-/// Read a PNG and convert it to 8-bit greyscale.
+/// Read an image in any supported format and convert it to 8-bit greyscale.
 ///
-/// RGB(A) pixels are averaged as `(r + g + b) / 3`, matching the original.
+/// RGB pixels are averaged as `(r + g + b) / 3`, matching the original, and
+/// any alpha channel is discarded.
 pub fn read_greyscale(path: &str) -> Result<Grey, Box<dyn Error>> {
-    let (color_type, width, height, data) = decode_png(path)?;
-    let data = match color_type {
-        png::ColorType::Grayscale => data,
-        png::ColorType::GrayscaleAlpha => data.chunks_exact(2).map(|p| p[0]).collect(),
-        png::ColorType::Rgb => rgb_to_grey(&data, 3),
-        png::ColorType::Rgba => rgb_to_grey(&data, 4),
-        other => return Err(format!("unsupported PNG colour type: {other:?}").into()),
+    let image = decode_image(path)?;
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let data = if image.color().has_color() {
+        rgb_to_grey(image.to_rgb8().as_raw(), 3)
+    } else {
+        image.to_luma8().into_raw()
     };
 
     Ok(Grey {
@@ -582,37 +556,214 @@ pub fn read_greyscale(path: &str) -> Result<Grey, Box<dyn Error>> {
     })
 }
 
+/// The image codecs we know, chosen by file extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Codec {
+    /// A format the `image` crate decodes and encodes end to end.
+    Image(image::ImageFormat),
+    /// JPEG 2000 in a JP2 container (`.jp2`).
+    Jp2,
+    /// A bare JPEG 2000 codestream (`.j2k`, `.j2c`).
+    J2k,
+    /// HEIC/HEIF (`.heic`, `.heif`). Decode only: no encoder is linked.
+    Heic,
+}
+
+/// The image extensions we can read, for help and error text.
+pub const SUPPORTED_EXTENSIONS: &str =
+    "png, jpg/jpeg, tif/tiff, bmp, gif, webp, jp2, j2k/j2c, heic/heif";
+
+/// The extensions we can read but not write.
+pub const DECODE_ONLY_EXTENSIONS: &str = "heic/heif";
+
+/// Map a path's extension to a codec, or explain why we cannot.
+///
+/// Most formats are handled by the `image` crate; JPEG 2000 and HEIC have
+/// their own pure-Rust codecs. Adding a format means adding an arm here and,
+/// for an `image` format, enabling its feature in `Cargo.toml`.
+fn codec_for(path: &str) -> Result<Codec, Box<dyn Error>> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("png") => Ok(Codec::Image(image::ImageFormat::Png)),
+        Some("jpg" | "jpeg" | "jpe") => Ok(Codec::Image(image::ImageFormat::Jpeg)),
+        Some("tif" | "tiff") => Ok(Codec::Image(image::ImageFormat::Tiff)),
+        Some("bmp") => Ok(Codec::Image(image::ImageFormat::Bmp)),
+        Some("gif") => Ok(Codec::Image(image::ImageFormat::Gif)),
+        Some("webp") => Ok(Codec::Image(image::ImageFormat::WebP)),
+        Some("jp2") => Ok(Codec::Jp2),
+        Some("j2k" | "j2c") => Ok(Codec::J2k),
+        Some("heic" | "heif") => Ok(Codec::Heic),
+        Some(other) => Err(format!(
+            "unsupported image extension '.{other}' (supported: {SUPPORTED_EXTENSIONS})"
+        )
+        .into()),
+        None => Err(format!(
+            "cannot tell the image format of '{path}' from its extension \
+             (supported: {SUPPORTED_EXTENSIONS})"
+        )
+        .into()),
+    }
+}
+
+/// Decode a file into an 8-bit-per-channel image, choosing the decoder from
+/// the path's extension.
+fn decode_image(path: &str) -> Result<image::DynamicImage, Box<dyn Error>> {
+    match codec_for(path)? {
+        Codec::Image(format) => {
+            let mut reader = image::ImageReader::open(path)?;
+            reader.set_format(format);
+            Ok(reader.decode()?)
+        }
+        Codec::Jp2 | Codec::J2k => decode_jpeg2000(path),
+        Codec::Heic => decode_heic(path),
+    }
+}
+
+/// Decode a JPEG 2000 codestream or JP2 file into an image.
+///
+/// `oxideav-jpeg2000` hands back each component as a separate plane, so this
+/// re-interleaves them. Only the shape `pie` can also write is accepted: one
+/// or three unsigned components of 8 bits, all at full resolution.
+fn decode_jpeg2000(path: &str) -> Result<image::DynamicImage, Box<dyn Error>> {
+    let bytes = std::fs::read(path)?;
+    let decoded = if oxideav_jpeg2000::looks_like_jp2(&bytes) {
+        oxideav_jpeg2000::jp2::decode_jp2(&bytes)?
+    } else {
+        oxideav_jpeg2000::decode_j2k(&bytes)?
+    };
+
+    let (width, height) = (decoded.width, decoded.height);
+    let components = decoded.components.len();
+    let plain = decoded
+        .components
+        .iter()
+        .all(|c| !c.is_signed && c.precision_bits <= 8 && c.width == width && c.height == height);
+    if !plain || !(components == 1 || components == 3) {
+        return Err(format!(
+            "unsupported JPEG 2000 layout in '{path}': need 1 or 3 unsigned 8-bit \
+             components at full resolution"
+        )
+        .into());
+    }
+
+    let pixels = (width as usize) * (height as usize);
+    let mut samples = vec![0u8; pixels * components];
+    for (channel, component) in decoded.components.iter().enumerate() {
+        for (i, &sample) in component.samples.iter().enumerate() {
+            samples[i * components + channel] = sample.clamp(0, 255) as u8;
+        }
+    }
+    from_samples(path, width, height, components, samples)
+}
+
+/// Decode a HEIC/HEIF file into an image.
+///
+/// `heic-rs` has no encoder, so this is the only direction HEIC supports.
+fn decode_heic(path: &str) -> Result<image::DynamicImage, Box<dyn Error>> {
+    let bytes = std::fs::read(path)?;
+    let decoded = heic_rs::decode(&bytes, &heic_rs::DecodeOptions::default())?;
+    match decoded.layout {
+        heic_rs::PixelLayout::Rgb8 => {
+            from_samples(path, decoded.width, decoded.height, 3, decoded.data)
+        }
+        other => {
+            Err(format!("HEIC decoder returned {other:?} rather than RGB8 for '{path}'").into())
+        }
+    }
+}
+
+/// Build an image from interleaved 8-bit samples of one or three channels.
+fn from_samples(
+    path: &str,
+    width: u32,
+    height: u32,
+    components: usize,
+    samples: Vec<u8>,
+) -> Result<image::DynamicImage, Box<dyn Error>> {
+    match components {
+        1 => Ok(image::DynamicImage::ImageLuma8(
+            image::GrayImage::from_raw(width, height, samples)
+                .ok_or_else(|| format!("'{path}': greyscale buffer size mismatch"))?,
+        )),
+        3 => Ok(image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_raw(width, height, samples)
+                .ok_or_else(|| format!("'{path}': RGB buffer size mismatch"))?,
+        )),
+        n => Err(format!("'{path}': {n} components is not supported").into()),
+    }
+}
+
 fn rgb_to_grey(data: &[u8], stride: usize) -> Vec<u8> {
     data.chunks_exact(stride)
         .map(|p| ((p[0] as u16 + p[1] as u16 + p[2] as u16) / 3) as u8)
         .collect()
 }
 
-/// Write an 8-bit greyscale PNG.
+/// Write an 8-bit greyscale image, choosing the encoder from the path's
+/// extension.
 pub fn write_greyscale(
     path: &str,
     width: u32,
     height: u32,
     data: &[u8],
 ) -> Result<(), Box<dyn Error>> {
-    let w = std::io::BufWriter::new(File::create(path)?);
-    let mut encoder = png::Encoder::new(w, width, height);
-    encoder.set_color(png::ColorType::Grayscale);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header()?;
-    writer.write_image_data(data)?;
-    Ok(())
+    let buffer = image::GrayImage::from_raw(width, height, data.to_vec())
+        .ok_or_else(|| format!("greyscale buffer is not {width}x{height} bytes"))?;
+    write_image(path, &image::DynamicImage::ImageLuma8(buffer))
 }
 
-/// Write an 8-bit RGB PNG.
+/// Write an 8-bit RGB image, choosing the encoder from the path's extension.
 pub fn write_rgb(path: &str, width: u32, height: u32, data: &[u8]) -> Result<(), Box<dyn Error>> {
-    let w = std::io::BufWriter::new(File::create(path)?);
-    let mut encoder = png::Encoder::new(w, width, height);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header()?;
-    writer.write_image_data(data)?;
-    Ok(())
+    let buffer = image::RgbImage::from_raw(width, height, data.to_vec())
+        .ok_or_else(|| format!("RGB buffer is not {width}x{height} pixels"))?;
+    write_image(path, &image::DynamicImage::ImageRgb8(buffer))
+}
+
+/// Encode an image to `path`, choosing the codec from its extension.
+fn write_image(path: &str, image: &image::DynamicImage) -> Result<(), Box<dyn Error>> {
+    match codec_for(path)? {
+        Codec::Image(format) => {
+            image.save_with_format(path, format)?;
+            Ok(())
+        }
+        Codec::Jp2 => {
+            std::fs::write(path, encode_jpeg2000(image, true)?)?;
+            Ok(())
+        }
+        Codec::J2k => {
+            std::fs::write(path, encode_jpeg2000(image, false)?)?;
+            Ok(())
+        }
+        Codec::Heic => Err(format!(
+            "cannot write '{path}': HEIC/HEIF is decode-only (no encoder is \
+             linked); choose another output extension"
+        )
+        .into()),
+    }
+}
+
+/// Encode an image as JPEG 2000, wrapped in a JP2 container when `jp2` is
+/// set and as a bare codestream otherwise.
+///
+/// The codestream is the reversible 5-3 one, so the pixels survive a decode
+/// unchanged.
+fn encode_jpeg2000(image: &image::DynamicImage, jp2: bool) -> Result<Vec<u8>, Box<dyn Error>> {
+    let (width, height) = (image.width(), image.height());
+    let (samples, components) = if image.color().has_color() {
+        (image.to_rgb8().into_raw(), 3usize)
+    } else {
+        (image.to_luma8().into_raw(), 1usize)
+    };
+
+    let codestream = oxideav_jpeg2000::encode_jpeg2000(&samples, width, height)?;
+    if !jp2 {
+        return Ok(codestream);
+    }
+    let options = oxideav_jpeg2000::jp2::Jp2WriteOptions::for_components(components);
+    Ok(oxideav_jpeg2000::jp2::write_jp2(&codestream, &options)?)
 }
 
 /// Tunable error bounds for the tree fits.
@@ -768,5 +919,133 @@ mod tests {
         assert_eq!(options.max_error, MAX_ERROR);
         assert_eq!(options.chroma_max_error, CHROMA_MAX_ERROR);
         assert!(options.chroma_max_error > options.max_error);
+    }
+
+    #[test]
+    fn codec_is_chosen_from_the_extension() {
+        for (path, expected) in [
+            ("lena.PNG", Codec::Image(image::ImageFormat::Png)),
+            ("lena.jpg", Codec::Image(image::ImageFormat::Jpeg)),
+            ("lena.JPEG", Codec::Image(image::ImageFormat::Jpeg)),
+            ("lena.jpe", Codec::Image(image::ImageFormat::Jpeg)),
+            ("lena.tif", Codec::Image(image::ImageFormat::Tiff)),
+            ("lena.TIFF", Codec::Image(image::ImageFormat::Tiff)),
+            ("lena.bmp", Codec::Image(image::ImageFormat::Bmp)),
+            ("lena.gif", Codec::Image(image::ImageFormat::Gif)),
+            ("lena.webp", Codec::Image(image::ImageFormat::WebP)),
+            ("lena.jp2", Codec::Jp2),
+            ("lena.j2k", Codec::J2k),
+            ("lena.J2C", Codec::J2k),
+            ("lena.heic", Codec::Heic),
+            ("lena.HEIF", Codec::Heic),
+        ] {
+            assert_eq!(codec_for(path).unwrap(), expected, "for {path}");
+        }
+    }
+
+    #[test]
+    fn unrecognised_or_missing_extension_is_rejected() {
+        for path in ["lena.pcx", "lena.xyz", "lena", "lena."] {
+            assert!(codec_for(path).is_err(), "{path} should not be supported");
+        }
+    }
+
+    #[test]
+    fn round_trips_every_supported_format() {
+        // Eight distinct colours (24 bytes), so a palette-based GIF keeps the
+        // colour type.
+        let rgb: Vec<u8> = (0..24u8).map(|i| i * 10).collect();
+        let path_of = |ext: &str| {
+            std::env::temp_dir()
+                .join(format!("fractal_pie_round_trip_{ext}.{ext}"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        for extension in ["png", "bmp", "tif", "gif", "webp", "jpg", "jp2", "j2k"] {
+            let path = path_of(extension);
+            write_rgb(&path, 4, 2, &rgb).unwrap();
+            let decoded = read_image(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+
+            let Image::Colour(colour) = decoded else {
+                panic!("{extension}: expected a colour image back");
+            };
+            assert_eq!((colour.width, colour.height), (4, 2), "{extension}");
+        }
+    }
+
+    #[test]
+    fn greyscale_round_trips_through_png() {
+        let data = [0u8, 50, 100, 150, 200, 250];
+        let path = std::env::temp_dir().join("fractal_pie_grey_round_trip.png");
+        let path = path.to_str().unwrap();
+
+        write_greyscale(path, 3, 2, &data).unwrap();
+        let grey = read_greyscale(path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!((grey.width, grey.height), (3, 2));
+        assert_eq!(grey.data, data);
+    }
+
+    #[test]
+    fn greyscale_jpeg2000_round_trips_losslessly() {
+        let data = [0u8, 50, 100, 150, 200, 250];
+        let path = std::env::temp_dir().join("fractal_pie_grey_lossless.jp2");
+        let path = path.to_str().unwrap();
+
+        write_greyscale(path, 3, 2, &data).unwrap();
+        let decoded = decode_image(path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(!decoded.color().has_color(), "should stay greyscale");
+        assert_eq!(decoded.to_luma8().into_raw(), data);
+    }
+
+    #[test]
+    fn jpeg2000_round_trips_losslessly() {
+        // 4x4 RGB. JPEG 2000 uses the reversible 5-3 kernel, so the samples
+        // written must come back byte for byte.
+        let rgb: Vec<u8> = (0..48u16).map(|i| (i * 5) as u8).collect();
+        for extension in ["jp2", "j2k"] {
+            let path = std::env::temp_dir().join(format!("fractal_pie_lossless.{extension}"));
+            let path = path.to_str().unwrap();
+
+            write_rgb(path, 4, 4, &rgb).unwrap();
+            let decoded = decode_image(path).unwrap();
+            let _ = std::fs::remove_file(path);
+
+            assert_eq!(decoded.to_rgb8().into_raw(), rgb, "{extension}");
+        }
+    }
+
+    #[test]
+    fn jpeg2000_writes_the_container_the_extension_asks_for() {
+        let rgb = [0u8; 48];
+        for (extension, is_container) in [("jp2", true), ("j2k", false)] {
+            let path = std::env::temp_dir().join(format!("fractal_pie_container.{extension}"));
+            let path = path.to_str().unwrap();
+
+            write_rgb(path, 4, 4, &rgb).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            let _ = std::fs::remove_file(path);
+
+            assert_eq!(
+                oxideav_jpeg2000::looks_like_jp2(&bytes),
+                is_container,
+                ".{extension} should {} a JP2 container",
+                if is_container { "be" } else { "not be" },
+            );
+        }
+    }
+
+    #[test]
+    fn heic_is_decode_only() {
+        let path = std::env::temp_dir().join("fractal_pie_never.heic");
+        let error = write_rgb(path.to_str().unwrap(), 1, 1, &[0, 0, 0]).unwrap_err();
+        assert!(error.to_string().contains("decode-only"), "{error}");
+        assert!(!path.exists(), "nothing should have been written");
     }
 }

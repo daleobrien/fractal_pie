@@ -3,7 +3,7 @@
 //! Options may be written `--name value` or `--name=value`; a bare `-` or
 //! anything not starting with `-` is a path.
 
-use crate::{Options, CHROMA_MAX_ERROR, MAX_ERROR};
+use crate::{Options, CHROMA_MAX_ERROR, DECODE_ONLY_EXTENSIONS, MAX_ERROR, SUPPORTED_EXTENSIONS};
 
 pub const DEFAULT_INPUT: &str = "lena.png";
 pub const DEFAULT_PIE: &str = "lena.pie";
@@ -145,7 +145,7 @@ pub fn parse_decoder(argv: &[String]) -> Result<Parse<DecodeArgs>, String> {
 }
 
 pub fn print_encoder_usage() {
-    println!("usage: pie-encode [input.png] [output.pie] [--max-error N] [--chroma-max-error N]");
+    println!("usage: pie-encode [input] [output.pie] [--max-error N] [--chroma-max-error N]");
     println!();
     println!("Fits a plane to each region of a tree, then entropy-codes the tree into a");
     println!(".pie file. A larger error bound tolerates a coarser fit, so fewer regions are");
@@ -160,12 +160,15 @@ pub fn print_encoder_usage() {
         CHROMA_MAX_ERROR
     );
     println!();
-    println!("Greyscale PNGs are encoded directly; colour PNGs use 4:2:0 YCbCr.");
+    println!("Greyscale images are encoded directly; colour images use 4:2:0 YCbCr.");
+    println!("The input format is taken from its extension: {SUPPORTED_EXTENSIONS}.");
     println!("Images of any dimensions are accepted.");
 }
 
 pub fn print_decoder_usage() {
-    println!("usage: pie-decode [input.pie] [output.png]");
+    println!("usage: pie-decode [input.pie] [output]");
     println!();
-    println!("Decodes a .pie file written by pie-encode back into a PNG.");
+    println!("Decodes a .pie file written by pie-encode back into an image.");
+    println!("The output format is taken from its extension: {SUPPORTED_EXTENSIONS}.");
+    println!("{DECODE_ONLY_EXTENSIONS} is decode-only: no HEIC encoder is linked.");
 }

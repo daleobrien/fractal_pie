@@ -1,4 +1,4 @@
-//! `pie-encode`: compress a PNG into a `.pie` file.
+//! `pie-encode`: compress an image into a `.pie` file.
 
 use std::env;
 use std::process::ExitCode;

@@ -17,14 +17,14 @@ adaptive range coder.
 
 ## Building and running
 
-There are two binaries. `pie-encode` compresses a PNG into a `.pie` file:
+There are two binaries. `pie-encode` compresses an image into a `.pie` file:
 
     cargo run --release --bin pie-encode -- lena.png lena.pie
 
     processing  lena.png (  786432 bytes)
     wrote       lena.pie (   57369 bytes, colour (7.3%, 1.75 bpp))
 
-`pie-decode` turns it back into a PNG:
+`pie-decode` turns it back into an image (here a PNG):
 
     cargo run --release --bin pie-decode -- lena.pie decoded_lena.png
 
@@ -38,8 +38,8 @@ The decoded image is bit-for-bit identical to the reference render above.
 Input and output paths can be overridden, and both error bounds are optional
 flags on the encoder:
 
-    pie-encode [input.png] [output.pie] [--max-error N] [--chroma-max-error N]
-    pie-decode [input.pie] [output.png]
+    pie-encode [input] [output.pie] [--max-error N] [--chroma-max-error N]
+    pie-decode [input.pie] [output]
 
 `--max-error` is the luma (and greyscale) bound; `--chroma-max-error` is the
 chroma bound. A larger bound tolerates a coarser fit, so fewer regions are
@@ -57,6 +57,40 @@ subdivided and the file gets smaller. For the 512x512 Lena image:
 
 The luma plane dominates: once the chroma bound reaches about 128 the chroma
 planes cost next to nothing.
+
+### Image formats
+
+The format is chosen from the file extension, in both directions:
+
+| extension         | format    | read | write |
+| ----------------- | --------- | ---- | ----- |
+| `.png`            | PNG       | yes  | yes   |
+| `.jpg` / `.jpeg`  | JPEG      | yes  | yes   |
+| `.tif` / `.tiff`  | TIFF      | yes  | yes   |
+| `.bmp`            | BMP       | yes  | yes   |
+| `.gif`            | GIF       | yes  | yes   |
+| `.webp`           | WebP      | yes  | yes   |
+| `.jp2`            | JPEG 2000 | yes  | yes   |
+| `.j2k` / `.j2c`   | JPEG 2000 | yes  | yes   |
+| `.heic` / `.heif` | HEIC      | yes  | no    |
+
+So `pie-decode lena.pie lena.jpg` writes a JPEG and `pie-encode photo.tiff
+photo.pie` reads a TIFF. An unrecognised extension is an error rather than a
+guess. Any listed input can be decoded to any listed output, except that HEIC
+is read-only.
+
+Most formats go through [the `image` crate](https://docs.rs/image), which
+normalises bit depth and palettes. JPEG 2000 uses
+[`oxideav-jpeg2000`](https://docs.rs/oxideav-jpeg2000): a `.jp2` output is a
+JP2 container and a `.j2k` / `.j2c` output a bare codestream, both with the
+reversible 5-3 kernel, so they round-trip losslessly. HEIC reads through
+[`heic-rs`](https://docs.rs/heic-rs); that crate is a decoder, so writing a
+`.heic` is refused with an explanation. All three are pure Rust under
+permissive licences — nothing here links a C library or takes on AGPL/GPL
+terms.
+
+JPEG is lossy and GIF is palettised, so those outputs only approximate the
+`.pie` payload; PNG, TIFF, BMP, WebP and JPEG 2000 round-trip losslessly.
 
 ### Aspect ratio
 

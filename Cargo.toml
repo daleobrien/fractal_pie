@@ -6,7 +6,16 @@ description = "Fractal image compression by quadtree plane fitting"
 readme = "README.md"
 
 [dependencies]
-png = "0.17"
+heic-rs = "0.1.1"
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "tiff",
+    "bmp",
+    "gif",
+    "webp",
+] }
+oxideav-jpeg2000 = { version = "0.0.16", default-features = false }
 rayon = "1"
 
 [profile.release]

@@ -1,4 +1,4 @@
-//! `pie-decode`: reconstruct a PNG from a `.pie` file.
+//! `pie-decode`: reconstruct an image from a `.pie` file.
 
 use std::env;
 use std::process::ExitCode;

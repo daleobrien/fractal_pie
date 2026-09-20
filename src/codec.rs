@@ -546,7 +546,7 @@ pub fn decode_to_image(data: &[u8]) -> Result<(Image, PieInfo), Box<dyn Error>> 
     }
 }
 
-/// Read a PNG, compress it to a `.pie` file, and print the resulting sizes.
+/// Read an image, compress it to a `.pie` file, and print the resulting sizes.
 pub fn encode_file(input: &str, output: &str, options: Options) -> Result<(), Box<dyn Error>> {
     let image = crate::read_image(input)?;
     let raw = raw_bytes(&image);
@@ -569,7 +569,7 @@ pub fn encode_file(input: &str, output: &str, options: Options) -> Result<(), Bo
     Ok(())
 }
 
-/// Read a `.pie` file, decode it, and write the reconstructed PNG.
+/// Read a `.pie` file, decode it, and write the reconstructed image.
 pub fn decode_file(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
     println!("decoding    {input}");
 
