@@ -20,9 +20,11 @@
 //! # Tree coding
 //!
 //! Nodes are visited in the same depth-first order [`walk`] produces its
-//! leaves in. Every internal node codes one *split* bit (0 = leaf, 1 = split);
-//! a 1x1 node can never split, so its split bit is implied and not coded. A
-//! leaf then codes its plane `pixel = a*i + b*j + c` as three integers.
+//! leaves in. Every node codes one *split* bit (0 = leaf, 1 = split); a node
+//! that is a single pixel can never split, so its split bit is implied and not
+//! coded. The child rectangles (two or four) follow from the parent's shape,
+//! so they cost nothing to convey. A leaf then codes its plane
+//! `pixel = a*i + b*j + c` as three integers.
 //!
 //! The split bit is coded against a context built from three things:
 //!
@@ -48,8 +50,7 @@ use std::error::Error;
 
 use crate::range::{BitModel, Decoder, Encoder};
 use crate::{
-    combine_to_rgb, split_range_into_quad, square_edge, walk, Colour, Grey, Image, Leaf, Options,
-    Plane,
+    combine_to_rgb, split_rect, walk, Colour, Grey, Image, Leaf, Options, Plane, Rect,
 };
 
 /// File magic; the trailing digit is the format version.
@@ -187,17 +188,16 @@ impl PlaneModels {
     }
 }
 
-/// Compare a neighbour's leaf size to this node's size.
+/// Compare a neighbour's leaf area to this node's area.
 ///
-/// A leaf of exactly size `n` covering `(x, y)` must start at `(x, y)` (both
-/// are aligned to `n`), so this cleanly tells the three interesting cases
-/// apart: the neighbour was split finer than this node, is a leaf of the same
-/// size, or is part of a coarser leaf that never reached this depth.
+/// A smaller leaf means the region above was subdivided more finely, a larger
+/// one that it stayed coarse. Area is the natural scale once leaves may be
+/// non-square, and for a square quadtree it reduces to comparing edge lengths.
 #[inline]
-fn classify(neighbour: usize, n: usize) -> usize {
-    if neighbour < n {
+fn classify(neighbour_area: usize, area: usize) -> usize {
+    if neighbour_area < area {
         1
-    } else if neighbour == n {
+    } else if neighbour_area == area {
         2
     } else {
         3
@@ -209,8 +209,8 @@ struct Recon {
     w: usize,
     buf: Vec<u8>,
     mask: Vec<bool>,
-    /// Size of the leaf that owns each painted pixel, used as split context.
-    leaf_size: Vec<u32>,
+    /// Area of the leaf that owns each painted pixel, used as split context.
+    leaf_area: Vec<u32>,
 }
 
 impl Recon {
@@ -219,7 +219,7 @@ impl Recon {
             w,
             buf: vec![0u8; w * h],
             mask: vec![false; w * h],
-            leaf_size: vec![0u32; w * h],
+            leaf_area: vec![0u32; w * h],
         }
     }
 
@@ -227,15 +227,15 @@ impl Recon {
     /// top-left corner was split. The rows above are visited first, so the
     /// answer is already known; it is `0` when nothing has been painted there
     /// yet (the top row of the image).
-    fn spatial_ctx(&self, x: usize, y: usize, n: usize) -> usize {
-        if x == 0 {
+    fn spatial_ctx(&self, rect: Rect) -> usize {
+        if rect.x == 0 {
             return 0;
         }
-        let idx = (x - 1) * self.w + y;
+        let idx = (rect.x - 1) * self.w + rect.y;
         if !self.mask[idx] {
             return 0;
         }
-        classify(self.leaf_size[idx] as usize, n)
+        classify(self.leaf_area[idx] as usize, rect.area())
     }
 
     /// Predict a leaf's constant term from the reconstructed pixels above-left,
@@ -279,16 +279,17 @@ impl Recon {
         }
     }
 
-    /// Paint a leaf's plane over its sub-image, exactly as [`crate::render`]
-    /// would, recording the leaf size for later spatial contexts.
-    fn paint(&mut self, plane: &Plane, x: usize, y: usize, n: usize) {
-        for i in 0..n {
-            let base = (x + i) * self.w + y;
+    /// Paint a leaf's plane over its region, exactly as [`crate::render`]
+    /// would, recording the leaf area for later spatial contexts.
+    fn paint(&mut self, plane: &Plane, rect: Rect) {
+        let area = rect.area() as u32;
+        for i in 0..rect.h {
+            let base = (rect.x + i) * self.w + rect.y;
             let ai = plane.a * i as i64 + plane.c;
-            for j in 0..n {
+            for j in 0..rect.w {
                 self.buf[base + j] = (ai + plane.b * j as i64).clamp(0, 255) as u8;
                 self.mask[base + j] = true;
-                self.leaf_size[base + j] = n as u32;
+                self.leaf_area[base + j] = area;
             }
         }
     }
@@ -314,35 +315,32 @@ fn encode_node(
     recon: &mut Recon,
     leaves: &[Leaf],
     idx: &mut usize,
-    x: usize,
-    y: usize,
-    n: usize,
+    rect: Rect,
     depth: usize,
     prev_split: bool,
 ) -> bool {
     let leaf = leaves[*idx];
-    let is_leaf = leaf.x == x && leaf.y == y && leaf.n == n;
+    let is_leaf = leaf.rect == rect;
 
-    if n > 1 {
-        let ctx = models.split_index(depth, prev_split, recon.spatial_ctx(x, y, n));
+    if rect.can_split() {
+        let ctx = models.split_index(depth, prev_split, recon.spatial_ctx(rect));
         enc.encode_bit(&mut models.split[ctx], if is_leaf { 0 } else { 1 });
     }
 
     if is_leaf {
         *idx += 1;
-        let pred = recon.predict(x, y);
+        let pred = recon.predict(rect.x, rect.y);
         models.a.encode_signed(enc, leaf.plane.a);
         models.b.encode_signed(enc, leaf.plane.b);
         models.c.encode_signed(enc, leaf.plane.c - pred);
-        recon.paint(&leaf.plane, x, y, n);
+        recon.paint(&leaf.plane, rect);
         true
     } else {
-        let quads = split_range_into_quad(x, y, n);
+        let children = split_rect(rect);
         let mut prev_child_leaf = false;
-        for (j, &(qx, qy, qn)) in quads.iter().enumerate() {
+        for (j, &child) in children.as_slice().iter().enumerate() {
             let prev = j > 0 && !prev_child_leaf;
-            prev_child_leaf =
-                encode_node(enc, models, recon, leaves, idx, qx, qy, qn, depth + 1, prev);
+            prev_child_leaf = encode_node(enc, models, recon, leaves, idx, child, depth + 1, prev);
         }
         false
     }
@@ -354,39 +352,37 @@ fn decode_node(
     dec: &mut Decoder,
     models: &mut PlaneModels,
     recon: &mut Recon,
-    x: usize,
-    y: usize,
-    n: usize,
+    rect: Rect,
     depth: usize,
     prev_split: bool,
 ) -> bool {
-    let is_leaf = if n <= 1 {
+    let is_leaf = if !rect.can_split() {
         true
     } else {
-        let ctx = models.split_index(depth, prev_split, recon.spatial_ctx(x, y, n));
+        let ctx = models.split_index(depth, prev_split, recon.spatial_ctx(rect));
         dec.decode_bit(&mut models.split[ctx]) == 0
     };
 
     if is_leaf {
         let a = models.a.decode_signed(dec);
         let b = models.b.decode_signed(dec);
-        let pred = recon.predict(x, y);
+        let pred = recon.predict(rect.x, rect.y);
         let c = models.c.decode_signed(dec) + pred;
-        recon.paint(&Plane { a, b, c }, x, y, n);
+        recon.paint(&Plane { a, b, c }, rect);
         true
     } else {
-        let quads = split_range_into_quad(x, y, n);
+        let children = split_rect(rect);
         let mut prev_child_leaf = false;
-        for (j, &(qx, qy, qn)) in quads.iter().enumerate() {
+        for (j, &child) in children.as_slice().iter().enumerate() {
             let prev = j > 0 && !prev_child_leaf;
-            prev_child_leaf = decode_node(dec, models, recon, qx, qy, qn, depth + 1, prev);
+            prev_child_leaf = decode_node(dec, models, recon, child, depth + 1, prev);
         }
         false
     }
 }
 
-/// Encode one plane of `n x n` tiles, appending to the shared coder.
-fn encode_plane(enc: &mut Encoder, leaves: &[Leaf], w: usize, h: usize, n: usize) {
+/// Encode one plane of `w` x `h` pixels, appending to the shared coder.
+fn encode_plane(enc: &mut Encoder, leaves: &[Leaf], w: usize, h: usize) {
     let mut models = PlaneModels::new();
     let mut recon = Recon::new(w, h);
     let mut idx = 0usize;
@@ -396,19 +392,17 @@ fn encode_plane(enc: &mut Encoder, leaves: &[Leaf], w: usize, h: usize, n: usize
         &mut recon,
         leaves,
         &mut idx,
-        0,
-        0,
-        n,
+        Rect::whole(w, h),
         0,
         false,
     );
 }
 
-/// Decode one plane of `n x n` tiles from the shared coder.
-fn decode_plane(dec: &mut Decoder, w: usize, h: usize, n: usize) -> Vec<u8> {
+/// Decode one plane of `w` x `h` pixels from the shared coder.
+fn decode_plane(dec: &mut Decoder, w: usize, h: usize) -> Vec<u8> {
     let mut models = PlaneModels::new();
     let mut recon = Recon::new(w, h);
-    decode_node(dec, &mut models, &mut recon, 0, 0, n, 0, false);
+    decode_node(dec, &mut models, &mut recon, Rect::whole(w, h), 0, false);
     recon.buf
 }
 
@@ -466,32 +460,40 @@ pub fn encode_to_vec(image: &Image, options: Options) -> Result<Encoded, Box<dyn
 
     match image {
         Image::Grey(img) => {
-            let n = square_edge(img.width, img.height)?;
-            let tree = walk(&img.data, img.width, 0, 0, n, options.max_error);
+            let tree = walk(
+                &img.data,
+                img.width,
+                Rect::whole(img.width, img.height),
+                options.max_error,
+            );
             estimate = tree.tree_len / 8 + tree.params_len + 2;
 
-            encode_plane(&mut enc, &tree.leaves, img.width, img.height, n);
+            encode_plane(&mut enc, &tree.leaves, img.width, img.height);
 
             mode = MODE_GREY;
             width = img.width as u32;
             height = img.height as u32;
         }
         Image::Colour(img) => {
-            let n = square_edge(img.width, img.height)?;
             let (cw, ch) = img.chroma_dims();
 
             // Luma gets the tight bound; the quarter-size chroma planes get
             // the looser one.
-            let y_tree = walk(&img.y, img.width, 0, 0, n, options.max_error);
-            let cb_tree = walk(&img.cb, cw, 0, 0, cw, options.chroma_max_error);
-            let cr_tree = walk(&img.cr, cw, 0, 0, cw, options.chroma_max_error);
+            let y_tree = walk(
+                &img.y,
+                img.width,
+                Rect::whole(img.width, img.height),
+                options.max_error,
+            );
+            let cb_tree = walk(&img.cb, cw, Rect::whole(cw, ch), options.chroma_max_error);
+            let cr_tree = walk(&img.cr, cw, Rect::whole(cw, ch), options.chroma_max_error);
             estimate = (y_tree.tree_len + cb_tree.tree_len + cr_tree.tree_len) / 8
                 + (y_tree.params_len + cb_tree.params_len + cr_tree.params_len)
                 + 2;
 
-            encode_plane(&mut enc, &y_tree.leaves, img.width, img.height, n);
-            encode_plane(&mut enc, &cb_tree.leaves, cw, ch, cw);
-            encode_plane(&mut enc, &cr_tree.leaves, cw, ch, cw);
+            encode_plane(&mut enc, &y_tree.leaves, img.width, img.height);
+            encode_plane(&mut enc, &cb_tree.leaves, cw, ch);
+            encode_plane(&mut enc, &cr_tree.leaves, cw, ch);
 
             mode = MODE_COLOUR;
             width = img.width as u32;
@@ -517,17 +519,14 @@ pub fn decode_to_image(data: &[u8]) -> Result<(Image, PieInfo), Box<dyn Error>> 
     let (info, payload) = read_header(data)?;
     let width = info.width as usize;
     let height = info.height as usize;
-    if width != height {
-        return Err(format!("image must be square, got {width}x{height}").into());
-    }
 
     let mut dec = Decoder::new(payload);
     if info.colour {
         let cw = width.div_ceil(2);
         let ch = height.div_ceil(2);
-        let y = decode_plane(&mut dec, width, height, width);
-        let cb = decode_plane(&mut dec, cw, ch, cw);
-        let cr = decode_plane(&mut dec, cw, ch, cw);
+        let y = decode_plane(&mut dec, width, height);
+        let cb = decode_plane(&mut dec, cw, ch);
+        let cr = decode_plane(&mut dec, cw, ch);
         let colour = Colour {
             width,
             height,
@@ -537,7 +536,7 @@ pub fn decode_to_image(data: &[u8]) -> Result<(Image, PieInfo), Box<dyn Error>> 
         };
         Ok((Image::Colour(colour), info))
     } else {
-        let plane = decode_plane(&mut dec, width, height, width);
+        let plane = decode_plane(&mut dec, width, height);
         let grey = Grey {
             width,
             height,
@@ -597,7 +596,7 @@ pub fn decode_file(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{render, Grey, MAX_ERROR};
+    use crate::{render, Grey, Rect, MAX_ERROR};
 
     fn grey_image(width: usize, height: usize, f: impl Fn(usize, usize) -> u8) -> Grey {
         let mut data = vec![0u8; width * height];
@@ -621,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_orders_leaf_sizes() {
+    fn classify_orders_leaf_areas() {
         assert_eq!(classify(4, 8), 1);
         assert_eq!(classify(8, 8), 2);
         assert_eq!(classify(16, 8), 3);
@@ -676,7 +675,7 @@ mod tests {
 
         let expected = match &image {
             Image::Grey(g) => {
-                let tree = walk(&g.data, g.width, 0, 0, g.width, MAX_ERROR);
+                let tree = walk(&g.data, g.width, Rect::whole(g.width, g.height), MAX_ERROR);
                 render(g.width, g.height, &tree.leaves)
             }
             _ => unreachable!(),
@@ -713,21 +712,94 @@ mod tests {
 
         // Luma uses MAX_ERROR; chroma uses CHROMA_MAX_ERROR.
         let expected_y = {
-            let tree = walk(&y, width, 0, 0, width, MAX_ERROR);
+            let tree = walk(&y, width, Rect::whole(width, height), MAX_ERROR);
             render(width, height, &tree.leaves)
         };
         let expected_cb = {
-            let tree = walk(&cb, cw, 0, 0, cw, crate::CHROMA_MAX_ERROR);
+            let tree = walk(&cb, cw, Rect::whole(cw, ch), crate::CHROMA_MAX_ERROR);
             render(cw, ch, &tree.leaves)
         };
         let expected_cr = {
-            let tree = walk(&cr, cw, 0, 0, cw, crate::CHROMA_MAX_ERROR);
+            let tree = walk(&cr, cw, Rect::whole(cw, ch), crate::CHROMA_MAX_ERROR);
             render(cw, ch, &tree.leaves)
         };
 
         match decoded {
             Image::Colour(c) => {
                 assert_eq!(c.y, expected_y);
+                assert_eq!(c.cb, expected_cb);
+                assert_eq!(c.cr, expected_cr);
+            }
+            _ => panic!("expected colour"),
+        }
+    }
+
+    #[test]
+    fn non_square_round_trip_matches_render() {
+        // A wide, prime-sized image: the tree must bisect the long side
+        // repeatedly without squaring off the strip.
+        let width = 97;
+        let height = 13;
+        let image = Image::Grey(grey_image(width, height, |r, c| {
+            let ramp = (r * 3 + c) as u8;
+            if (40..60).contains(&c) {
+                ramp.wrapping_add(120)
+            } else {
+                ramp
+            }
+        }));
+
+        let encoded = encode_to_vec(&image, Options::default()).unwrap();
+        let (decoded, info) = decode_to_image(&encoded.bytes).unwrap();
+        assert_eq!((info.width, info.height), (width as u32, height as u32));
+
+        let expected = match &image {
+            Image::Grey(g) => {
+                let tree = walk(&g.data, g.width, Rect::whole(g.width, g.height), MAX_ERROR);
+                render(g.width, g.height, &tree.leaves)
+            }
+            _ => unreachable!(),
+        };
+
+        match decoded {
+            Image::Grey(g) => assert_eq!(g.data, expected),
+            _ => panic!("expected greyscale"),
+        }
+    }
+
+    #[test]
+    fn non_square_chroma_planes_are_not_square() {
+        // `cw` and `ch` differ here, so this fails if the chroma planes are
+        // walked or reconstructed as squares.
+        let width: usize = 5;
+        let height: usize = 3;
+        let cw = width.div_ceil(2);
+        let ch = height.div_ceil(2);
+        let y: Vec<u8> = (0..width * height).map(|i| (i * 7 % 256) as u8).collect();
+        let cb: Vec<u8> = (0..cw * ch).map(|i| (i * 13 % 256) as u8).collect();
+        let cr: Vec<u8> = (0..cw * ch).map(|i| (i * 29 % 256) as u8).collect();
+        let image = Image::Colour(Colour {
+            width,
+            height,
+            y: y.clone(),
+            cb: cb.clone(),
+            cr: cr.clone(),
+        });
+
+        let encoded = encode_to_vec(&image, Options::default()).unwrap();
+        let (decoded, _) = decode_to_image(&encoded.bytes).unwrap();
+
+        let expected_cb = {
+            let tree = walk(&cb, cw, Rect::whole(cw, ch), crate::CHROMA_MAX_ERROR);
+            render(cw, ch, &tree.leaves)
+        };
+        let expected_cr = {
+            let tree = walk(&cr, cw, Rect::whole(cw, ch), crate::CHROMA_MAX_ERROR);
+            render(cw, ch, &tree.leaves)
+        };
+
+        match decoded {
+            Image::Colour(c) => {
                 assert_eq!(c.cb, expected_cb);
                 assert_eq!(c.cr, expected_cr);
             }

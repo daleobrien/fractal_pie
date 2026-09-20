@@ -1,8 +1,11 @@
-//! Fractal image compression by recursively fitting planes to a quadtree.
+//! Fractal image compression by recursively fitting planes to a tree.
 //!
-//! For each square sub-image we fit the plane `pixel = a*i + b*j + c` by
+//! For each rectangular region we fit the plane `pixel = a*i + b*j + c` by
 //! least squares. If the mean-squared error of that fit exceeds a threshold
-//! the sub-image is split into four quadrants and the process repeats on each.
+//! the region is subdivided and the process repeats on each child: a region
+//! close to square splits into four quadrants, while an elongated one splits
+//! in two along its longer side. Keeping every child near-square lets a single
+//! tree cover an image of any dimensions (see [`split_rect`]).
 //!
 //! Colour images are converted to YCbCr and encoded as 4:2:0. The luma plane
 //! is fitted at full resolution; the chroma planes (`Cb`, `Cr`) are averaged
@@ -37,8 +40,8 @@ pub const MAX_ERROR: f64 = 32.0;
 /// chroma planes subdivide less often and cost far fewer leaves.
 pub const CHROMA_MAX_ERROR: f64 = 64.0;
 
-/// Below this edge length the quadtree is walked serially. Larger sub-images
-/// are split across threads; the recursion is only 4-way, so this keeps the
+/// Below this longer-side length the tree is walked serially. Larger regions
+/// are split across threads; the fan-out is at most 4-way, so this keeps the
 /// number of rayon tasks modest.
 const PARALLEL_MIN_EDGE: usize = 128;
 
@@ -57,6 +60,63 @@ pub struct Fit {
     pub plane: Plane,
     /// Mean-squared error between the clamped plane and the source pixels.
     pub error: f64,
+}
+
+/// An axis-aligned region of a plane: `h` rows by `w` columns, with its
+/// top-left pixel at `(x, y)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    pub x: usize,
+    pub y: usize,
+    pub h: usize,
+    pub w: usize,
+}
+
+impl Rect {
+    /// The rectangle covering a whole `width` x `height` plane.
+    pub fn whole(width: usize, height: usize) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            h: height,
+            w: width,
+        }
+    }
+
+    /// Number of pixels in the region.
+    #[inline]
+    pub fn area(&self) -> usize {
+        self.h * self.w
+    }
+
+    /// A region can only be subdivided if it spans more than one pixel; a
+    /// single pixel is always a leaf.
+    #[inline]
+    pub fn can_split(&self) -> bool {
+        self.h > 1 || self.w > 1
+    }
+}
+
+/// The children of a subdivided [`Rect`].
+///
+/// A near-square region is cut into four quadrants, as in a classic quadtree.
+/// An elongated region is instead cut in two along its longer side, which keeps
+/// every child's aspect ratio within a factor of two and stops a thin strip
+/// from forcing the tree to resolve the short dimension everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Children {
+    Two([Rect; 2]),
+    Four([Rect; 4]),
+}
+
+impl Children {
+    #[inline]
+    pub fn as_slice(&self) -> &[Rect] {
+        match self {
+            Children::Two(rs) => rs,
+            Children::Four(rs) => rs,
+        }
+    }
 }
 
 /// An 8-bit greyscale image in row-major order.
@@ -84,23 +144,21 @@ pub enum Image {
     Colour(Colour),
 }
 
-/// One leaf of the quadtree: a square sub-image described by a single plane.
+/// One leaf of the tree: a rectangular region described by a single plane.
 #[derive(Clone, Copy, Debug)]
 pub struct Leaf {
-    pub x: usize,
-    pub y: usize,
-    pub n: usize,
+    pub rect: Rect,
     pub plane: Plane,
 }
 
-/// The quadtree produced for one sub-image, flattened into its leaves plus the
-/// running lengths of the original `tree` and `parameters` bit/lists used to
-/// estimate the compressed size.
+/// The tree produced for one region, flattened into its leaves plus the counts
+/// used to estimate the compressed size.
 pub(crate) struct Subtree {
     pub(crate) leaves: Vec<Leaf>,
-    /// Number of entries the original code would have appended to `tree`.
+    /// Number of tree nodes; the naive estimate codes one split bit per node.
     pub(crate) tree_len: u64,
-    /// Number of entries the original code would have appended to `parameters`.
+    /// Number of plane parameters; the naive estimate spends three bytes per
+    /// leaf.
     pub(crate) params_len: u64,
 }
 
@@ -126,42 +184,70 @@ fn solve3(a: &[[f64; 3]; 3], b: &[f64; 3]) -> [f64; 3] {
     [det3(&a1) / d, det3(&a2) / d, det3(&a3) / d]
 }
 
-/// Fit the plane `pixel = a*i + b*j + c` to the `n` x `n` sub-image whose
-/// top-left corner is `(x_offset, y_offset)`, using ordinary least squares.
+/// Round as the original Python does: `int(v + 0.499999)` truncates toward
+/// zero, as does `as i64`.
+#[inline]
+fn round(v: f64) -> i64 {
+    (v + 0.499999) as i64
+}
+
+/// Solve the 2x2 system `a * x = b` by Cramer's rule.
+#[inline]
+fn solve2(a: [[f64; 2]; 2], b: [f64; 2]) -> [f64; 2] {
+    let d = a[0][0] * a[1][1] - a[0][1] * a[1][0];
+    [
+        (b[0] * a[1][1] - a[0][1] * b[1]) / d,
+        (a[0][0] * b[1] - b[0] * a[1][0]) / d,
+    ]
+}
+
+/// Fit the plane `pixel = a*i + b*j + c` to the region `rect` of `image`
+/// (row-major, `width` pixels per row), using ordinary least squares.
 ///
-/// The normal-equations matrix only depends on `n`, which the original code
-/// exploits to avoid re-summing the pixel coordinates.
-pub fn find_plane(image: &[u8], width: usize, x_offset: usize, y_offset: usize, n: usize) -> Fit {
+/// The normal-equations matrix depends only on the region's dimensions, which
+/// lets the coordinate sums be computed in closed form rather than re-summing
+/// them per pixel. When the region is a single row (or column) the matching
+/// gradient is unidentifiable, so it is pinned to zero and the remaining
+/// coefficients are solved from the 2x2 system — matching numpy's minimum-norm
+/// `lstsq`.
+pub fn find_plane(image: &[u8], width: usize, rect: Rect) -> Fit {
+    let (h, w) = (rect.h, rect.w);
+
     // A single pixel has a singular normal-equations matrix (the row and
-    // column terms are all zero). numpy's lstsq returns the minimum-norm
-    // solution, which here is simply the pixel value at the origin.
-    if n == 1 {
-        let z = image[x_offset * width + y_offset] as i64;
+    // column terms are all zero). The minimum-norm solution is simply the
+    // pixel value at the origin.
+    if h * w == 1 {
+        let z = image[rect.x * width + rect.y] as i64;
         return Fit {
             plane: Plane { a: 0, b: 0, c: z },
             error: 0.0,
         };
     }
 
-    let ni = n as i64;
-    let m = ni - 1;
-    let sn_i = ni * ni;
+    let (hi, wi) = (h as i64, w as i64);
+    let sn = (hi * wi) as f64;
 
-    // Sums of the coordinate terms over an n x n grid. Computed exactly in
-    // integers, exactly as the Python version does before it divides.
-    let sxx = (m * (2 * ni - 1) * sn_i) as f64 / 6.0;
-    let syx = (m * m * sn_i) as f64 / 4.0;
-    let sx = (m * sn_i) as f64 / 2.0;
-    let sn = sn_i as f64;
+    // Sums of the coordinate terms over the h x w grid, computed exactly in
+    // integers.
+    let sum_i = hi * (hi - 1) / 2;
+    let sum_j = wi * (wi - 1) / 2;
+    let sum_i2 = (hi - 1) * hi * (2 * hi - 1) / 6;
+    let sum_j2 = (wi - 1) * wi * (2 * wi - 1) / 6;
+
+    let sxx = (sum_i2 * wi) as f64;
+    let syy = (sum_j2 * hi) as f64;
+    let sxy = (sum_i * sum_j) as f64;
+    let sx = (sum_i * wi) as f64;
+    let sy = (sum_j * hi) as f64;
 
     let mut sxz: i64 = 0;
     let mut syz: i64 = 0;
     let mut sz: i64 = 0;
-    for i in 0..ni {
-        let base = (x_offset + i as usize) * width + y_offset;
+    for i in 0..hi {
+        let base = (rect.x + i as usize) * width + rect.y;
         let mut row_sum: i64 = 0;
         let mut row_jz: i64 = 0;
-        for j in 0..ni {
+        for j in 0..wi {
             let z = image[base + j as usize] as i64;
             row_sum += z;
             row_jz += j * z;
@@ -171,20 +257,24 @@ pub fn find_plane(image: &[u8], width: usize, x_offset: usize, y_offset: usize, 
         sz += row_sum;
     }
 
-    let a_mat = [[sxx, syx, sx], [syx, sxx, sx], [sx, sx, sn]];
-    let b_vec = [sxz as f64, syz as f64, sz as f64];
-    let sol = solve3(&a_mat, &b_vec);
-
-    // `int(v + 0.499999)` in Python truncates toward zero, as does `as i64`.
-    let a = (sol[0] + 0.499999) as i64;
-    let b = (sol[1] + 0.499999) as i64;
-    let c = (sol[2] + 0.499999) as i64;
+    let (a, b, c) = if h == 1 {
+        let sol = solve2([[syy, sy], [sy, sn]], [syz as f64, sz as f64]);
+        (0, round(sol[0]), round(sol[1]))
+    } else if w == 1 {
+        let sol = solve2([[sxx, sx], [sx, sn]], [sxz as f64, sz as f64]);
+        (round(sol[0]), 0, round(sol[1]))
+    } else {
+        let a_mat = [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, sn]];
+        let b_vec = [sxz as f64, syz as f64, sz as f64];
+        let sol = solve3(&a_mat, &b_vec);
+        (round(sol[0]), round(sol[1]), round(sol[2]))
+    };
 
     let mut err: i64 = 0;
-    for i in 0..ni {
-        let base = (x_offset + i as usize) * width + y_offset;
+    for i in 0..hi {
+        let base = (rect.x + i as usize) * width + rect.y;
         let ai = a * i + c;
-        for j in 0..ni {
+        for j in 0..wi {
             let z = image[base + j as usize] as i64;
             let new_z = (ai + b * j).clamp(0, 255);
             let e = new_z - z;
@@ -198,30 +288,81 @@ pub fn find_plane(image: &[u8], width: usize, x_offset: usize, y_offset: usize, 
     }
 }
 
-/// Split the square range `(x, y, n)` into four quadrants.
-pub fn split_range_into_quad(x: usize, y: usize, n: usize) -> [(usize, usize, usize); 4] {
-    let m = n.div_ceil(2);
-    [(x, y, m), (x, y + m, m), (x + m, y, m), (x + m, y + m, m)]
+/// Subdivide a rectangle, keeping its children's aspect ratios bounded.
+///
+/// When one side is at least twice the other the region is bisected along its
+/// longer side, giving two children; otherwise it is cut into four quadrants.
+/// The choice follows from the region's dimensions alone, so the decoder
+/// derives the same subdivision with no extra bits. Children are ordered
+/// top-left, top-right, bottom-left, bottom-right — the depth-first order the
+/// tree is coded in.
+pub fn split_rect(rect: Rect) -> Children {
+    debug_assert!(rect.can_split());
+
+    if rect.w >= 2 * rect.h {
+        // Wide and thin: cut vertically.
+        let m = rect.w.div_ceil(2);
+        Children::Two([
+            Rect { w: m, ..rect },
+            Rect {
+                y: rect.y + m,
+                w: rect.w - m,
+                ..rect
+            },
+        ])
+    } else if rect.h >= 2 * rect.w {
+        // Tall and thin: cut horizontally.
+        let m = rect.h.div_ceil(2);
+        Children::Two([
+            Rect { h: m, ..rect },
+            Rect {
+                x: rect.x + m,
+                h: rect.h - m,
+                ..rect
+            },
+        ])
+    } else {
+        let mh = rect.h.div_ceil(2);
+        let mw = rect.w.div_ceil(2);
+        Children::Four([
+            Rect {
+                h: mh,
+                w: mw,
+                ..rect
+            },
+            Rect {
+                y: rect.y + mw,
+                h: mh,
+                w: rect.w - mw,
+                ..rect
+            },
+            Rect {
+                x: rect.x + mh,
+                h: rect.h - mh,
+                w: mw,
+                ..rect
+            },
+            Rect {
+                x: rect.x + mh,
+                y: rect.y + mw,
+                h: rect.h - mh,
+                w: rect.w - mw,
+            },
+        ])
+    }
 }
 
-pub(crate) fn walk(
-    image: &[u8],
-    width: usize,
-    x: usize,
-    y: usize,
-    n: usize,
-    max_error: f64,
-) -> Subtree {
-    let fit = find_plane(image, width, x, y, n);
+pub(crate) fn walk(image: &[u8], width: usize, rect: Rect, max_error: f64) -> Subtree {
+    let fit = find_plane(image, width, rect);
 
-    if fit.error > max_error {
-        let quads = split_range_into_quad(x, y, n);
+    if fit.error > max_error && rect.can_split() {
+        let children = split_rect(rect);
 
-        // The original appends a `1` marker, then the children, then a `0`.
+        // Each node costs one split bit; only leaves carry plane parameters.
         let mut subtree = Subtree {
             leaves: Vec::new(),
-            tree_len: 2,
-            params_len: 3,
+            tree_len: 1,
+            params_len: 0,
         };
 
         let absorb = |child: Subtree, subtree: &mut Subtree| {
@@ -230,17 +371,18 @@ pub(crate) fn walk(
             subtree.leaves.extend(child.leaves);
         };
 
-        if n >= PARALLEL_MIN_EDGE {
-            let children: Vec<Subtree> = quads
+        let kids = children.as_slice();
+        if rect.h.max(rect.w) >= PARALLEL_MIN_EDGE {
+            let walked: Vec<Subtree> = kids
                 .par_iter()
-                .map(|&(qx, qy, qn)| walk(image, width, qx, qy, qn, max_error))
+                .map(|&child| walk(image, width, child, max_error))
                 .collect();
-            for child in children {
+            for child in walked {
                 absorb(child, &mut subtree);
             }
         } else {
-            for &(qx, qy, qn) in &quads {
-                absorb(walk(image, width, qx, qy, qn, max_error), &mut subtree);
+            for &child in kids {
+                absorb(walk(image, width, child, max_error), &mut subtree);
             }
         }
 
@@ -248,9 +390,7 @@ pub(crate) fn walk(
     } else {
         Subtree {
             leaves: vec![Leaf {
-                x,
-                y,
-                n,
+                rect,
                 plane: fit.plane,
             }],
             tree_len: 1,
@@ -259,15 +399,16 @@ pub(crate) fn walk(
     }
 }
 
-/// Render the quadtree: every leaf paints its plane over its own sub-image.
+/// Render the tree: every leaf paints its plane over its own region.
 /// Leaves tile the whole image, so no parent region is needed.
 pub fn render(width: usize, height: usize, leaves: &[Leaf]) -> Vec<u8> {
     let mut out = vec![0u8; width * height];
     for leaf in leaves {
-        for i in 0..leaf.n {
-            let base = (leaf.x + i) * width + leaf.y;
+        let r = leaf.rect;
+        for i in 0..r.h {
+            let base = (r.x + i) * width + r.y;
             let ai = leaf.plane.a * i as i64 + leaf.plane.c;
-            for j in 0..leaf.n {
+            for j in 0..r.w {
                 out[base + j] = (ai + leaf.plane.b * j as i64).clamp(0, 255) as u8;
             }
         }
@@ -474,16 +615,7 @@ pub fn write_rgb(path: &str, width: u32, height: u32, data: &[u8]) -> Result<(),
     Ok(())
 }
 
-/// Images are compressed as a single square quadtree, so the input must be
-/// square.
-pub(crate) fn square_edge(width: usize, height: usize) -> Result<usize, Box<dyn Error>> {
-    if width != height {
-        return Err(format!("image must be square, got {width}x{height}").into());
-    }
-    Ok(width)
-}
-
-/// Tunable error bounds for the quadtree fits.
+/// Tunable error bounds for the tree fits.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     /// Bound for the luma plane of a colour image, and for any greyscale
@@ -517,23 +649,69 @@ mod tests {
             }
         }
 
-        let fit = find_plane(&image, 4, 0, 0, 4);
+        let fit = find_plane(&image, 4, Rect::whole(4, 4));
         assert_eq!(fit.plane, Plane { a: 2, b: 3, c: 5 });
         assert_eq!(fit.error, 0.0);
     }
 
     #[test]
-    fn split_range_into_quad_divides_correctly() {
+    fn square_region_splits_into_quadrants() {
         assert_eq!(
-            split_range_into_quad(8, 8, 4),
-            [(8, 8, 2), (8, 10, 2), (10, 8, 2), (10, 10, 2)]
+            split_rect(Rect { x: 8, y: 8, h: 4, w: 4 }),
+            Children::Four([
+                Rect { x: 8, y: 8, h: 2, w: 2 },
+                Rect { x: 8, y: 10, h: 2, w: 2 },
+                Rect { x: 10, y: 8, h: 2, w: 2 },
+                Rect { x: 10, y: 10, h: 2, w: 2 },
+            ])
         );
+    }
+
+    #[test]
+    fn elongated_region_bisects_its_longer_side() {
+        // Wide: cut vertically into two.
+        assert_eq!(
+            split_rect(Rect { x: 0, y: 0, h: 2, w: 8 }),
+            Children::Two([
+                Rect { x: 0, y: 0, h: 2, w: 4 },
+                Rect { x: 0, y: 4, h: 2, w: 4 },
+            ])
+        );
+        // Tall: cut horizontally into two.
+        assert_eq!(
+            split_rect(Rect { x: 0, y: 0, h: 8, w: 2 }),
+            Children::Two([
+                Rect { x: 0, y: 0, h: 4, w: 2 },
+                Rect { x: 4, y: 0, h: 4, w: 2 },
+            ])
+        );
+    }
+
+    #[test]
+    fn splits_tile_their_parent_exactly() {
+        for h in 1..12usize {
+            for w in 1..12usize {
+                let rect = Rect { x: 3, y: 5, h, w };
+                if !rect.can_split() {
+                    continue;
+                }
+                let children = split_rect(rect);
+                let mut area = 0;
+                for c in children.as_slice() {
+                    assert!(c.h > 0 && c.w > 0, "empty child of {rect:?}");
+                    assert!(c.x >= rect.x && c.y >= rect.y, "child {c:?} escapes {rect:?}");
+                    assert!(c.x + c.h <= rect.x + rect.h && c.y + c.w <= rect.y + rect.w);
+                    area += c.area();
+                }
+                assert_eq!(area, rect.area(), "children of {rect:?} do not tile it");
+            }
+        }
     }
 
     #[test]
     fn single_pixel_is_a_leaf() {
         let image = [123u8];
-        let fit = find_plane(&image, 1, 0, 0, 1);
+        let fit = find_plane(&image, 1, Rect::whole(1, 1));
         assert_eq!(fit.plane, Plane { a: 0, b: 0, c: 123 });
         assert_eq!(fit.error, 0.0);
     }

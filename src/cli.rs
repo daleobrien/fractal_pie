@@ -147,7 +147,7 @@ pub fn parse_decoder(argv: &[String]) -> Result<Parse<DecodeArgs>, String> {
 pub fn print_encoder_usage() {
     println!("usage: pie-encode [input.png] [output.pie] [--max-error N] [--chroma-max-error N]");
     println!();
-    println!("Fits a plane to each region of a quadtree, then entropy-codes the tree into a");
+    println!("Fits a plane to each region of a tree, then entropy-codes the tree into a");
     println!(".pie file. A larger error bound tolerates a coarser fit, so fewer regions are");
     println!("subdivided and the file gets smaller.");
     println!();
@@ -161,6 +161,7 @@ pub fn print_encoder_usage() {
     );
     println!();
     println!("Greyscale PNGs are encoded directly; colour PNGs use 4:2:0 YCbCr.");
+    println!("Images of any dimensions are accepted.");
 }
 
 pub fn print_decoder_usage() {

@@ -4,11 +4,14 @@ fractal_pie
 Just playing around with image compression. Written in Rust.
 
 The program fits a plane, described by `pixel = a*i + b*j + c` (where `i` and
-`j` are the row and column offsets within a sub-image), through the image data
-by least squares. If the mean-squared error is too great with respect to the
-raw image, the image is broken up into 4 sub-images and the process is repeated
-on each one. The resulting quadtree of planes is the compressed representation,
-and it is written to a `.pie` file with an adaptive range coder.
+`j` are the row and column offsets within a region), through the image data by
+least squares. If the mean-squared error is too great with respect to the raw
+image, the region is subdivided and the process is repeated on each child: a
+region close to square is cut into four quadrants, while a long thin one is cut
+in two along its longer side. Keeping the children near-square this way lets a
+single tree cover an image of any dimensions. The resulting tree of planes is
+the compressed representation, and it is written to a `.pie` file with an
+adaptive range coder.
 
 ![Lena](https://raw.githubusercontent.com/daleobrien/fractal_pie/master/lena.png)
 
@@ -55,8 +58,25 @@ subdivided and the file gets smaller. For the 512x512 Lena image:
 The luma plane dominates: once the chroma bound reaches about 128 the chroma
 planes cost next to nothing.
 
-The input must be a square PNG. Already-greyscale inputs skip the YCbCr step
-and are encoded directly:
+### Aspect ratio
+
+A near-square region is still cut into four quadrants; a region whose sides
+differ by more than 2:1 is instead cut in two along its longer side. Both
+choices follow from the region's dimensions alone, so the decoder reproduces
+them for free and no image has to be padded to a square. The extra two-way
+nodes cost very little, even at extreme ratios:
+
+| image   | `.pie` | ratio   |
+| ------- | ------ | ------- |
+| 512x512 | 57369  | 13.71:1 |
+| 512x200 | 27457  | 11.19:1 |
+| 200x512 | 27198  | 11.29:1 |
+| 1024x64 | 13983  | 14.06:1 |
+
+The non-square figures are crops/rescales of Lena, all at the default bounds.
+
+Any image dimensions are supported. Already-greyscale inputs skip the YCbCr
+step and are encoded directly:
 
     processing  grey.png (  262144 bytes)
     wrote       grey.pie (   55487 bytes, greyscale (21.2%, 4.72:1))
@@ -117,7 +137,7 @@ Things that were tried and did **not** earn their keep, measured on Lena:
     9       4     height, little-endian u32
     13      8     luma max error as f64 bits, little-endian (metadata)
     21      8     chroma max error as f64 bits, little-endian (metadata)
-    29      ..    range-coded quadtree payload
+    29      ..    range-coded tree payload
 
 The payload is three range-coded bit streams (luma, then Cb and Cr for colour),
 concatenated. The error bounds are stored only so a file describes how it was
