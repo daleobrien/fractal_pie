@@ -21,6 +21,12 @@ use std::io::BufReader;
 
 use rayon::prelude::*;
 
+pub mod cli;
+mod codec;
+mod range;
+
+pub use codec::{decode_file, decode_to_image, encode_file, encode_to_vec, Encoded, PieInfo};
+
 /// Maximum mean-squared error tolerated by a fitted plane before the
 /// sub-image is subdivided. Matches the original `max_error` of 32. Used for
 /// the luma (brightness) plane.
@@ -90,12 +96,12 @@ pub struct Leaf {
 /// The quadtree produced for one sub-image, flattened into its leaves plus the
 /// running lengths of the original `tree` and `parameters` bit/lists used to
 /// estimate the compressed size.
-struct Subtree {
-    leaves: Vec<Leaf>,
+pub(crate) struct Subtree {
+    pub(crate) leaves: Vec<Leaf>,
     /// Number of entries the original code would have appended to `tree`.
-    tree_len: u64,
+    pub(crate) tree_len: u64,
     /// Number of entries the original code would have appended to `parameters`.
-    params_len: u64,
+    pub(crate) params_len: u64,
 }
 
 #[inline]
@@ -194,11 +200,18 @@ pub fn find_plane(image: &[u8], width: usize, x_offset: usize, y_offset: usize, 
 
 /// Split the square range `(x, y, n)` into four quadrants.
 pub fn split_range_into_quad(x: usize, y: usize, n: usize) -> [(usize, usize, usize); 4] {
-    let m = (n + 1) / 2;
+    let m = n.div_ceil(2);
     [(x, y, m), (x, y + m, m), (x + m, y, m), (x + m, y + m, m)]
 }
 
-fn walk(image: &[u8], width: usize, x: usize, y: usize, n: usize, max_error: f64) -> Subtree {
+pub(crate) fn walk(
+    image: &[u8],
+    width: usize,
+    x: usize,
+    y: usize,
+    n: usize,
+    max_error: f64,
+) -> Subtree {
     let fit = find_plane(image, width, x, y, n);
 
     if fit.error > max_error {
@@ -248,7 +261,7 @@ fn walk(image: &[u8], width: usize, x: usize, y: usize, n: usize, max_error: f64
 
 /// Render the quadtree: every leaf paints its plane over its own sub-image.
 /// Leaves tile the whole image, so no parent region is needed.
-fn render(width: usize, height: usize, leaves: &[Leaf]) -> Vec<u8> {
+pub fn render(width: usize, height: usize, leaves: &[Leaf]) -> Vec<u8> {
     let mut out = vec![0u8; width * height];
     for leaf in leaves {
         for i in 0..leaf.n {
@@ -338,7 +351,13 @@ impl Colour {
 /// Recombine full-resolution Y/Cb/Cr planes into an RGB8 buffer. The chroma
 /// planes are upsampled with nearest-neighbour: each chroma sample paints a
 /// 2x2 block, undoing the 4:2:0 subsampling.
-fn combine_to_rgb(width: usize, height: usize, y: &[u8], cb: &[u8], cr: &[u8]) -> Vec<u8> {
+pub(crate) fn combine_to_rgb(
+    width: usize,
+    height: usize,
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+) -> Vec<u8> {
     let cw = width.div_ceil(2);
     let mut rgb = vec![0u8; width * height * 3];
     for r in 0..height {
@@ -445,12 +464,7 @@ pub fn write_greyscale(
 }
 
 /// Write an 8-bit RGB PNG.
-pub fn write_rgb(
-    path: &str,
-    width: u32,
-    height: u32,
-    data: &[u8],
-) -> Result<(), Box<dyn Error>> {
+pub fn write_rgb(path: &str, width: u32, height: u32, data: &[u8]) -> Result<(), Box<dyn Error>> {
     let w = std::io::BufWriter::new(File::create(path)?);
     let mut encoder = png::Encoder::new(w, width, height);
     encoder.set_color(png::ColorType::Rgb);
@@ -462,18 +476,11 @@ pub fn write_rgb(
 
 /// Images are compressed as a single square quadtree, so the input must be
 /// square.
-fn square_edge(width: usize, height: usize) -> Result<usize, Box<dyn Error>> {
+pub(crate) fn square_edge(width: usize, height: usize) -> Result<usize, Box<dyn Error>> {
     if width != height {
         return Err(format!("image must be square, got {width}x{height}").into());
     }
     Ok(width)
-}
-
-/// Print the estimated compressed size and the ratio against the raw size.
-fn report(size: u64, raw: u64, kind: &str) {
-    println!("maybe need around {size} bytes to store compressed image ({kind})");
-    let ratio = raw as f64 / size as f64;
-    println!("compression ratio: {ratio:.2}:1 ({raw} bytes raw -> {size} bytes)");
 }
 
 /// Tunable error bounds for the quadtree fits.
@@ -494,58 +501,6 @@ impl Default for Options {
             chroma_max_error: CHROMA_MAX_ERROR,
         }
     }
-}
-
-/// Compress `input` into `output` using the default error bounds.
-pub fn compress(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
-    compress_with(input, output, Options::default())
-}
-
-/// Compress `input` into `output` with explicit error bounds, printing
-/// progress, the estimated compressed size, and the resulting compression
-/// ratio.
-///
-/// Greyscale PNGs are encoded directly; colour PNGs are converted to 4:2:0
-/// YCbCr and each of the three planes is encoded with its own quadtree.
-pub fn compress_with(input: &str, output: &str, options: Options) -> Result<(), Box<dyn Error>> {
-    println!("processing  {input}");
-
-    match read_image(input)? {
-        Image::Grey(image) => {
-            let n = square_edge(image.width, image.height)?;
-            let root = walk(&image.data, image.width, 0, 0, n, options.max_error);
-
-            let size = root.tree_len / 8 + root.params_len + 2;
-            report(size, (image.width * image.height) as u64, "greyscale");
-
-            let out = render(image.width, image.height, &root.leaves);
-            write_greyscale(output, image.width as u32, image.height as u32, &out)?;
-        }
-
-        Image::Colour(image) => {
-            let n = square_edge(image.width, image.height)?;
-            let (cw, ch) = image.chroma_dims();
-
-            // Luma gets the tight bound; the quarter-size chroma planes get
-            // the looser one.
-            let y_tree = walk(&image.y, image.width, 0, 0, n, options.max_error);
-            let cb_tree = walk(&image.cb, cw, 0, 0, cw, options.chroma_max_error);
-            let cr_tree = walk(&image.cr, cw, 0, 0, cw, options.chroma_max_error);
-
-            let size = (y_tree.tree_len + cb_tree.tree_len + cr_tree.tree_len) / 8
-                + (y_tree.params_len + cb_tree.params_len + cr_tree.params_len)
-                + 2;
-            report(size, (image.width * image.height * 3) as u64, "colour");
-
-            let y = render(image.width, image.height, &y_tree.leaves);
-            let cb = render(cw, ch, &cb_tree.leaves);
-            let cr = render(cw, ch, &cr_tree.leaves);
-            let rgb = combine_to_rgb(image.width, image.height, &y, &cb, &cr);
-            write_rgb(output, image.width as u32, image.height as u32, &rgb)?;
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -610,10 +565,7 @@ mod tests {
             0, 0, 255, 255, 255, 0,
         ];
         let image = Colour::from_rgb(&rgb, 2, 2);
-        assert_eq!(
-            (image.y.len(), image.cb.len(), image.cr.len()),
-            (4, 1, 1)
-        );
+        assert_eq!((image.y.len(), image.cb.len(), image.cr.len()), (4, 1, 1));
 
         let samples: Vec<(u8, u8, u8)> = (0..4)
             .map(|p| rgb_to_ycbcr(rgb[p * 3], rgb[p * 3 + 1], rgb[p * 3 + 2]))

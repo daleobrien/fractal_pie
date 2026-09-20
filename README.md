@@ -7,7 +7,62 @@ The program fits a plane, described by `pixel = a*i + b*j + c` (where `i` and
 `j` are the row and column offsets within a sub-image), through the image data
 by least squares. If the mean-squared error is too great with respect to the
 raw image, the image is broken up into 4 sub-images and the process is repeated
-on each one. The resulting quadtree of planes is the compressed representation.
+on each one. The resulting quadtree of planes is the compressed representation,
+and it is written to a `.pie` file with an adaptive range coder.
+
+![Lena](https://raw.githubusercontent.com/daleobrien/fractal_pie/master/lena.png)
+
+## Building and running
+
+There are two binaries. `pie-encode` compresses a PNG into a `.pie` file:
+
+    cargo run --release --bin pie-encode -- lena.png lena.pie
+
+    processing  lena.png
+    wrote       lena.pie (57498 bytes, colour)
+    quadtree estimate 131172 bytes -> 57498 bytes (43.8% of estimate)
+    compression ratio: 13.68:1 (786432 bytes raw -> 57498 bytes)
+
+`pie-decode` turns it back into a PNG:
+
+    cargo run --release --bin pie-decode -- lena.pie decoded_lena.png
+
+    decoding    lena.pie
+    wrote       decoded_lena.png (512x512 colour)
+
+![Colour](https://raw.githubusercontent.com/daleobrien/fractal_pie/master/output_lena.png)
+
+The decoded image is bit-for-bit identical to the reference render above.
+
+Input and output paths can be overridden, and both error bounds are optional
+flags on the encoder:
+
+    pie-encode [input.png] [output.pie] [--max-error N] [--chroma-max-error N]
+    pie-decode [input.pie] [output.png]
+
+`--max-error` is the luma (and greyscale) bound; `--chroma-max-error` is the
+chroma bound. A larger bound tolerates a coarser fit, so fewer regions are
+subdivided and the file gets smaller. For the 512x512 Lena image:
+
+| luma | chroma | `.pie` | ratio  |
+| ---- | ------ | ------ | ------ |
+| 32   | 16     | 67480  | 11.65:1 |
+| 32   | 32     | 61196  | 12.85:1 |
+| 32   | 64     | 57498  | 13.68:1 |
+| 32   | 128    | 55958  | 14.05:1 |
+| 32   | 256    | 55598  | 14.14:1 |
+| 64   | 64     | 38588  | 20.38:1 |
+| 16   | 64     | 86052  | 9.14:1 |
+
+The luma plane dominates: once the chroma bound reaches about 128 the chroma
+planes cost next to nothing.
+
+The input must be a square PNG. Already-greyscale inputs skip the YCbCr step
+and are encoded directly:
+
+    processing  grey.png
+    wrote       grey.pie (55621 bytes, greyscale)
+    compression ratio: 4.71:1 (262144 bytes raw -> 55621 bytes)
 
 ## Colour
 
@@ -18,60 +73,55 @@ blocks, quartering their size, and fitted with a looser bound
 (`CHROMA_MAX_ERROR = 64`): we do not have to fit chroma as tightly, since the
 eye is far less sensitive to colour detail than to brightness.
 
-Running,
+## Where the compression comes from
 
-    cargo run --release
+A naive encoding of the quadtree would spend one bit per tree entry and three
+bytes per leaf, which is what the program's `quadtree estimate` line reports.
+The `.pie` file does much better (13.68:1 instead of 6:1) by coding every
+decision against a probability that adapts as the image is processed:
 
-will take this file,
+* **Range coding.** Every bit goes through a binary range coder whose models
+  start at 1/2 and drift towards whatever actually happens, so a decision that
+  is almost always the same costs far less than one bit.
+* **Tree structure.** Each internal node codes one split bit, conditioned on
+  the node's depth and on whether its previous sibling split. A 1x1 node can
+  never split, so its split bit is implied and never coded.
+* **Predictive constants.** A leaf's `c` is the plane's value at its top-left
+  pixel, so it is predicted from the already-decoded pixels above and beside
+  that corner and only the residual is coded. This is what makes smooth regions
+  essentially free.
+* **Adaptive integer coding.** The plane's gradients `a` and `b` are near zero
+  over flat regions, so each integer is ZigZag-mapped and coded with an
+  adaptive Elias-gamma binarisation (a unary bit-length, then the mantissa).
 
-![Lena](https://raw.githubusercontent.com/daleobrien/fractal_pie/master/lena.png)
+Averaged over the planes, the result is about 1.4 bytes per leaf, against the
+3 bytes per leaf in the naive estimate.
 
-and produce this file,
-```
-  processing  lena.png
-  maybe need around 131172 bytes to store compressed image (colour)
-  compression ratio: 6.00:1 (786432 bytes raw -> 131172 bytes)
-```
-![Colour](https://raw.githubusercontent.com/daleobrien/fractal_pie/master/output_lena.png)
+## The `.pie` format
 
-Input and output paths can be overridden, and both error bounds are optional
-flags:
+    offset  size  field
+    0       4     magic "PIE1"
+    4       1     mode: 0 = greyscale, 1 = colour (4:2:0 YCbCr)
+    5       4     width, little-endian u32
+    9       4     height, little-endian u32
+    13      8     luma max error as f64 bits, little-endian (metadata)
+    21      8     chroma max error as f64 bits, little-endian (metadata)
+    29      ..    range-coded quadtree payload
 
-    cargo run --release -- [input.png] [output.png] [--max-error N] [--chroma-max-error N]
-
-`--max-error` is the luma (and greyscale) bound; `--chroma-max-error` is the
-chroma bound. A larger bound tolerates a coarser fit, so fewer regions are
-subdivided and the file gets smaller. For the 512x512 Lena image:
-
-| luma | chroma | bytes  | ratio  |
-| ---- | ------ | ------ | ------ |
-| 32   | 16     | 160462 | 4.90:1 |
-| 32   | 32     | 141335 | 5.56:1 |
-| 32   | 64     | 131172 | 6.00:1 |
-| 32   | 128    | 127246 | 6.18:1 |
-| 32   | 256    | 126261 | 6.23:1 |
-| 64   | 64     | 80849  | 9.73:1 |
-| 16   | 64     | 216403 | 3.63:1 |
-
-The luma plane dominates: once the chroma bound reaches about 128 the chroma
-planes cost next to nothing.
-
-The input must be a square PNG. Already-greyscale inputs skip the YCbCr step
-and are encoded directly:
-
-```
-  processing  grey.png
-  maybe need around 128035 bytes to store compressed image (greyscale)
-  compression ratio: 2.05:1 (262144 bytes raw -> 128035 bytes)
-```
+The payload is three range-coded bit streams (luma, then Cb and Cr for colour),
+concatenated. The error bounds are stored only so a file describes how it was
+made; the decoder does not need them. The decoder renders each leaf into a
+reconstruction buffer as it decodes it, which is the same buffer the encoder's
+predictor used, so the two stay in lockstep.
 
 ## Why it is fast
 
 The original Python prototype took roughly 39 seconds for the 512x512 Lena
 image. This port does the same work in about 10 milliseconds — the arithmetic
-is identical (the output image and the size estimate match byte for byte), but
-the per-pixel loops run as native code and the quadtree is traversed in
-parallel with [rayon](https://docs.rs/rayon).
+is identical (the reference render matches byte for byte), but the per-pixel
+loops run as native code and the quadtree is traversed in parallel with
+[rayon](https://docs.rs/rayon). Encoding the whole `.pie` takes about 10 ms and
+decoding is faster still.
 
 ## Tests
 
