@@ -18,9 +18,8 @@ There are two binaries. `pie-encode` compresses a PNG into a `.pie` file:
 
     cargo run --release --bin pie-encode -- lena.png lena.pie
 
-    processing  lena.png
-    wrote       lena.pie (57369 bytes, colour)
-    compression ratio: 13.71:1 (786432 bytes raw -> 57369 bytes)
+    processing  lena.png (  786432 bytes)
+    wrote       lena.pie (   57369 bytes, colour (7.3%, 13.71:1))
 
 `pie-decode` turns it back into a PNG:
 
@@ -59,9 +58,8 @@ planes cost next to nothing.
 The input must be a square PNG. Already-greyscale inputs skip the YCbCr step
 and are encoded directly:
 
-    processing  grey.png
-    wrote       grey.pie (55487 bytes, greyscale)
-    compression ratio: 4.72:1 (262144 bytes raw -> 55487 bytes)
+    processing  grey.png (  262144 bytes)
+    wrote       grey.pie (   55487 bytes, greyscale (21.2%, 4.72:1))
 
 ## Colour
 

@@ -450,10 +450,19 @@ fn read_header(data: &[u8]) -> Result<(PieInfo, &[u8]), Box<dyn Error>> {
     Ok((info, &data[HEADER_LEN..]))
 }
 
+/// Size in bytes of the equivalent raw bitmap for `image`.
+fn raw_bytes(image: &Image) -> u64 {
+    match image {
+        Image::Grey(g) => (g.width * g.height) as u64,
+        Image::Colour(c) => (c.width * c.height * 3) as u64,
+    }
+}
+
 /// Compress an already-decoded [`Image`] into a `.pie` file image.
 pub fn encode_to_vec(image: &Image, options: Options) -> Result<Encoded, Box<dyn Error>> {
     let mut enc = Encoder::new();
-    let (mode, width, height, raw, estimate);
+    let raw = raw_bytes(image);
+    let (mode, width, height, estimate);
 
     match image {
         Image::Grey(img) => {
@@ -466,7 +475,6 @@ pub fn encode_to_vec(image: &Image, options: Options) -> Result<Encoded, Box<dyn
             mode = MODE_GREY;
             width = img.width as u32;
             height = img.height as u32;
-            raw = (img.width * img.height) as u64;
         }
         Image::Colour(img) => {
             let n = square_edge(img.width, img.height)?;
@@ -488,7 +496,6 @@ pub fn encode_to_vec(image: &Image, options: Options) -> Result<Encoded, Box<dyn
             mode = MODE_COLOUR;
             width = img.width as u32;
             height = img.height as u32;
-            raw = (img.width * img.height * 3) as u64;
         }
     }
 
@@ -542,9 +549,10 @@ pub fn decode_to_image(data: &[u8]) -> Result<(Image, PieInfo), Box<dyn Error>> 
 
 /// Read a PNG, compress it to a `.pie` file, and print the resulting sizes.
 pub fn encode_file(input: &str, output: &str, options: Options) -> Result<(), Box<dyn Error>> {
-    println!("processing  {input}");
-
     let image = crate::read_image(input)?;
+    let raw = raw_bytes(&image);
+    println!("processing  {input} ({raw:>8} bytes)");
+
     let encoded = encode_to_vec(&image, options)?;
     std::fs::write(output, &encoded.bytes)?;
 
@@ -554,12 +562,9 @@ pub fn encode_file(input: &str, output: &str, options: Options) -> Result<(), Bo
     } else {
         "greyscale"
     };
-    println!("wrote       {output} ({size} bytes, {kind})");
-    println!(
-        "compression ratio: {:.2}:1 ({} bytes raw -> {size} bytes)",
-        encoded.raw as f64 / size as f64,
-        encoded.raw
-    );
+    let pct = 100.0 * size as f64 / raw as f64;
+    let ratio = raw as f64 / size as f64;
+    println!("wrote       {output} ({size:>8} bytes, {kind} ({pct:.1}%, {ratio:.2}:1))");
     Ok(())
 }
 
