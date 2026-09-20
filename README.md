@@ -1,4 +1,4 @@
-fractal_pie
+Fractal Pie
 ===========
 
 Just playing around with image compression. Written in Rust.
